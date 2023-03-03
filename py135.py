@@ -666,7 +666,7 @@ def convertTuple(tup):
     return str
 def usage():
     print("python sc.py domain/username password|hash targetip targetFQDN")
-if not (len(sys.argv) == 4 or len(sys.argv) == 5):
+if not (len(sys.argv) == 4 or len(sys.argv) == 5or len(sys.argv) == 6 or len(sys.argv) == 7):
     usage()
     exit()
 
@@ -703,12 +703,21 @@ if not ip_validation(targetip):
     usage()
     exit()
 print(f"[*] using target: {targetip}")
+
+targetFQDN=generate_random_string(8)
 my_codec='UTF-8'
 if len(sys.argv)==5:
     packet_delay = 1234
     my_codec=argv[4]
     print(f"[*] set packet send delay: {packet_delay}")
-
+kdc_host=''
+if len(sys.argv)==7:
+    my_codec=argv[4]
+    targetFQDN=argv[5]
+    kdc_host=argv[6]
+if len(sys.argv)==6:
+    targetFQDN=argv[4]
+    kdc_host=argv[5]
 # 参数处理完成--------------------------------------------------------------------
 
 
@@ -720,22 +729,29 @@ tsch_binding_string = hept_map(targetip,uuidtup_to_bin(('86D35949-83C9-4044-B424
 print(f"[+] get svcctl binding string: {scmr_binding_string}")
 print(f"[+] get tschsvc binding string: {tsch_binding_string}")
 
-targetFQDN=generate_random_string(8)
-
 scmrrpc = DCERPCTransportFactory(scmr_binding_string)
 scmrrpc.set_credentials(username=username,password=password,domain=domain,nthash=nthash)
 scmrrpc.setRemoteHost(targetip)
 scmrrpc.setRemoteName(targetFQDN)
 
-
 tschrpc = DCERPCTransportFactory(tsch_binding_string)
 tschrpc.set_credentials(username=username,password=password,domain=domain,nthash=nthash)
 tschrpc.setRemoteHost(targetip)
 tschrpc.setRemoteName(targetFQDN)
+
+if kdc_host!='':
+    scmrrpc.set_kerberos(True, kdc_host)
+    tschrpc.set_kerberos(True, kdc_host)
+
 try:
     svcctl=scmrrpc.get_dce_rpc()
+
     svcctl.set_credentials(*scmrrpc.get_credentials())
-    svcctl.set_auth_type(RPC_C_AUTHN_WINNT)
+    if kdc_host!='':
+        svcctl.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
+    else:
+        svcctl.set_auth_type(RPC_C_AUTHN_WINNT)
+
     svcctl.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
     svcctl.connect()
     svcctl.bind(scmr.MSRPC_UUID_SCMR)
@@ -744,7 +760,10 @@ try:
     print("[+] successfully connected to SCMR RPC")
     tschctl=tschrpc.get_dce_rpc()
     tschctl.set_credentials(*tschrpc.get_credentials())
-    tschctl.set_auth_type(RPC_C_AUTHN_WINNT)
+    if kdc_host!='':
+        tschctl.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
+    else:
+        tschctl.set_auth_type(RPC_C_AUTHN_WINNT)
     tschctl.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
     tschctl.connect()
     tschctl.bind(tsch.MSRPC_UUID_TSCHS)
