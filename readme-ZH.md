@@ -22,6 +22,8 @@ python 1.py ./Administrator :nthash 192.168.1.1
   
 命令执行：
 	直接输入命令即可
+
+输入q清理并退出
 ```
 
 # 票据认证的支持
