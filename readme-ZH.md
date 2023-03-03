@@ -1,6 +1,16 @@
 用法：
 ```
+入域主机
 python 1.py a.b/Administrator 12345 192.168.1.1
+
+python 1.py a.b/Administrator :nthash 192.168.1.1
+
+工作组
+
+python 1.py ./Administrator 12345 192.168.1.1
+
+python 1.py ./Administrator :nthash 192.168.1.1
+
 
 最后有一个可选项，是编码方式
 
