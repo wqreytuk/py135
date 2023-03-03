@@ -35,7 +35,11 @@ command execute:
 ```
 just input the command you want to execute
 ```
+clear and exit:
 
+```
+just input q
+```
 # kerberos auth
 
 if you already have a TGT or TGS, just set the ENV variable KRB5CCNAME, and the use it like this:
