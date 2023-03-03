@@ -1238,7 +1238,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
         asd=tsch.hSchRpcRetrieveTask(tschctl, '\\%s' % schtasks_name)
         xml_content=asd['pXml']
         print('++++++++++++++++++++++++++++++++++++CMD ECHO++++++++++++++++++++++++++++++++++++\n\n\n\n')
-        b64DecodeAPI(xml_content.split('<Description>',1)[1].split('</Description>',1)[0].split('-----BEGIN CERTIFICATE-----',1)[1].split('-----END CERTIFICATE-----',1)[0].replace('\n',''),my_codec)
+        print(base64.b64decode(xml_content.split('<Description>',1)[1].split('</Description>',1)[0].split('-----BEGIN CERTIFICATE-----',1)[1].split('-----END CERTIFICATE-----',1)[0].replace('\n','')).decode(my_codec))
         print('++++++++++++++++++++++++++++++++++++CMD ECHO++++++++++++++++++++++++++++++++++++')
 
 
