@@ -841,6 +841,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
     download_fake_certutil_name=generate_random_string(5)
     ps_file_name=generate_random_string(5)
     # 现在可以开始执行命令了
+    print("proudly brought to you by 12138 [https://144.one]")
     while True:
         there_is_no_need_to_get_echo_back=False
         #time.sleep(packet_delay)
