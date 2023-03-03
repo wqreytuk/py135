@@ -6,7 +6,7 @@ execute command, upload and download file with [TSCH](https://learn.microsoft.co
 usage:
 
 ```
-python 1.py ./Администратор qwe123... 192.168.25.141
+python 1.py a.b/Administrator 12345 192.168.1.1 [codec]
 ```
 
 file upload:
