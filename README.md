@@ -6,7 +6,16 @@ execute command, upload and download file with [TSCH](https://learn.microsoft.co
 usage:
 
 ```
+computers in Domain
 python 1.py a.b/Administrator 12345 192.168.1.1 [codec]
+
+python 1.py a.b/Administrator :nthash 192.168.1.1 [codec]
+
+computers in WorkGroup
+
+python 1.py ./Administrator 12345 192.168.1.1 [codec]
+
+python 1.py ./Administrator :nthash 192.168.1.1 [codec]
 ```
 
 file upload:
