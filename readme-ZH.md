@@ -23,3 +23,21 @@ python 1.py ./Administrator :nthash 192.168.1.1
 命令执行：
 	直接输入命令即可
 ```
+
+# 票据认证的支持
+
+如果你已经有了现成的TGS或者TGT票据，只需要设置环境变量KRB5CCNAME, 然后按照如下方法使用即可
+
+
+```
+a.lab/Administrator doesnotmatter_just_a_place_holder 192.168.159.156 [codec] targetFQDN dcIP
+```
+比如：
+
+```
+a.lab/Administrator just_a_place_holder 192.168.159.156 GBK adc.a.lab 192.168.159.156
+```
+或者不指定编码类型
+```
+a.lab/Administrator just_a_place_holder 192.168.159.156 adc.a.lab 192.168.159.156
+```
