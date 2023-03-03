@@ -1,4 +1,4 @@
-[中文]()
+[中文](https://github.com/wqreytuk/py135/blob/main/readme-ZH.md)
 
 
 execute command, upload and download file with [TSCH](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tsch/d1058a28-7e02-4948-8b8d-4a347fa64931)
