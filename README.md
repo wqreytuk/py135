@@ -35,3 +35,17 @@ command execute:
 ```
 just input the command you want to execute
 ```
+
+# kerberos auth
+
+if you already have a TGT or TGS, just set the ENV variable KRB5CCNAME, and the use it like this:
+
+
+```
+a.lab/Administrator doesnotmatter_just_a_place_holder 192.168.159.156 [codec] targetFQDN dcIP
+```
+eg:
+
+```
+a.lab/Administrator just_a_place_holder 192.168.159.156 GBK adc.a.lab 192.168.159.156
+```
