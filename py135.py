@@ -705,7 +705,7 @@ if not ip_validation(targetip):
 print(f"[*] using target: {targetip}")
 
 targetFQDN=generate_random_string(8)
-my_codec='UTF-8'
+my_codec='GBK'
 if len(sys.argv)==5:
     packet_delay = 1234
     my_codec=argv[4]
