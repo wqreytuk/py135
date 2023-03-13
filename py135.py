@@ -673,7 +673,7 @@ def convertTuple(tup):
     return str
 def usage():
     print("python sc.py domain/username password|hash targetip targetFQDN")
-if not (len(sys.argv) == 4 or len(sys.argv) == 5or len(sys.argv) == 6 or len(sys.argv) == 7):
+if not (len(sys.argv) == 4 or len(sys.argv) == 5 or len(sys.argv) == 6 or len(sys.argv) == 7):
     usage()
     exit()
 
