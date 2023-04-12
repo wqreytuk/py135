@@ -154,7 +154,7 @@ def wrap_cmd_exec(tschctl='tschctl',command='command',schtasks_name='schtasks_na
     tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
     while True:
-        time.sleep(0.5)
+        time.sleep(1)
         motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
         if motherfucker == '':
             continue
@@ -273,7 +273,7 @@ def delete_inter_file(bat_file_name='',copied_xml_file_name='xml_file_name',file
     tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
     while True:
-        time.sleep(0.5)
+        time.sleep(1)
         print(f"???????????????????DELETE bat and res file")# {bat_file_name}-----{bat_source_file_name}with mark {finish_mark}?????????????????????????????")
         motherfucker = retrive_service_description(svcctl, hService, service_desc_marker,my_codec=my_codec)
         if motherfucker=='':
@@ -304,7 +304,7 @@ $outputFile = "{0}_{1:0000}" -f $outputPrefix, $index;$index++;Set-Content -Path
         wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
         tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
         while True:
-            time.sleep(0.5)
+            time.sleep(1)
             print(f'?????????????????????EXECUTING {count} line makr with {finish_mark}????????????????????????')
             motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
             if motherfucker == '':
@@ -348,7 +348,7 @@ echo ^^^<Description^^^>^>description_header^&^&echo ^^^</Description^^^>^^^</Re
         wrap_hSchRpcRegisterTask(tschctl,command=command,schtasks_name=schtasks_name,action=tsch.TASK_UPDATE)
         tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
         while True:
-            time.sleep(0.5)
+            time.sleep(1)
             print(f'?????????????????????EXECUTING {count} line makr with {finish_mark}????????????????????????')
             motherfucker = retrive_service_description(svcctl, hService, service_desc_marker,my_codec=my_codec)
             if motherfucker=='':
@@ -810,7 +810,7 @@ try:
     # wrap_hSchRpcRegisterTask(tschctl,command='copy C:\\windows\\system32\\tasks\\'+schtasks_name+" C:\\users\\public\\" +xml_file_name,schtasks_name=schtasks_name)
     # tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
     # # 睡眠一秒，等待命令完成
-    # time.sleep(0.5)
+    # time.sleep(1)
 
 
 
@@ -850,7 +850,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
     wrap_hSchRpcRegisterTask(tschctl, command=bat_file_name + '.bat', schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
     tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
     while True:
-        time.sleep(0.5)
+        time.sleep(1)
         motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
         if motherfucker == '':
             continue
@@ -922,7 +922,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
             while True:
-                time.sleep(0.5)
+                time.sleep(1)
                 motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
                 if motherfucker == '':
                     continue
@@ -937,7 +937,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             # 需要考虑对文件进行分包上传
             if os.path.exists('.'+os.path.sep+'split'):
                 shutil.rmtree('.'+os.path.sep+'split')
-            time.sleep(0.5)
+            time.sleep(1)
             os.mkdir('.'+os.path.sep+'split')
             split_out_dir = '.'+os.path.sep+'split'
             i = 0
@@ -1017,7 +1017,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
                 tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
                 while True:
-                    time.sleep(0.5)
+                    time.sleep(1)
                     motherfucker=retrive_service_description(svcctl,hService,service_desc_marker,my_codec=my_codec)
                     if motherfucker == '':
                         continue
@@ -1037,7 +1037,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
             while True:
-                time.sleep(0.5)
+                time.sleep(1)
                 motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
                 if motherfucker == '':
                     continue
@@ -1109,7 +1109,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
             powershell_split_count=0
             while True:
-                time.sleep(0.5)
+                time.sleep(1)
                 motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
                 if motherfucker == '':
                     continue
@@ -1121,7 +1121,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             # 分割完成之后，需要按照分割的数量进行回传
             if os.path.exists('.'+os.path.sep+'split_for_download'):
                 shutil.rmtree('.'+os.path.sep+'split_for_download')
-            time.sleep(0.5)
+            time.sleep(1)
             os.mkdir('.'+os.path.sep+'split_for_download')
             split_out_dir = '.'+os.path.sep+'split_for_download'
             for i in range(powershell_split_count-1):
@@ -1206,7 +1206,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
         time_out_counter=0
         timoutfalg=False
         while True:
-            time.sleep(0.5)
+            time.sleep(1)
             time_out_counter=time_out_counter+1
             motherfucker=retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
             if time_out_counter==15:
@@ -1235,7 +1235,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
         tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
         while True:
-            time.sleep(0.5)
+            time.sleep(1)
             motherfucker=retrive_service_description(svcctl,hService,service_desc_marker,my_codec=my_codec)
             if motherfucker == '':
                 continue
@@ -1251,7 +1251,7 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
         tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
         while True:
-            time.sleep(0.5)
+            time.sleep(1)
             motherfucker=retrive_service_description(svcctl,hService,service_desc_marker,my_codec=my_codec)
             if motherfucker == '':
                 continue
