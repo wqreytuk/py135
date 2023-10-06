@@ -46,7 +46,7 @@ if you already have a TGT or TGS, just set the ENV variable KRB5CCNAME, and the 
 
 
 ```
-a.lab/Administrator doesnotmatter_just_a_place_holder 192.168.159.156 [codec] targetFQDN dcIP
+a.lab/Administrator doesnotmatter_just_a_place_holder target_ip [codec] targetFQDN dcIP
 ```
 eg:
 
