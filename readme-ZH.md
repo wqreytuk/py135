@@ -32,7 +32,7 @@ python 1.py ./Administrator :nthash 192.168.1.1
 
 
 ```
-a.lab/Administrator doesnotmatter_just_a_place_holder 192.168.159.156 [codec] targetFQDN dcIP
+a.lab/Administrator doesnotmatter_just_a_place_holder 目标IP [codec] targetFQDN 域控IP
 ```
 比如：
 
