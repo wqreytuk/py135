@@ -885,7 +885,7 @@ try:
                         there_is_no_need_to_get_echo_back = True
                         command = f'{your_cmd} && sc description {lpServiceName} "{service_desc_marker + finish_mark + service_desc_marker}"'
                 # 文件传输功能，开撸
-                elif your_cmd.split('up',1).__len__()>=2 and your_cmd.split('up', 1)[0]=='' and our_cmd.split('up', 1)[1][0]=='$'::
+                elif your_cmd.split('up',1).__len__()>=2 and your_cmd.split('up', 1)[0]=='' and our_cmd.split('up', 1)[1][0]=='$':
                         # 文件上传
                         # 首先对文件进行base64编码
                         if len(your_cmd.split('$'))!=3:
