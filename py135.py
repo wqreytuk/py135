@@ -893,10 +893,10 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
                 continue
             src_path=your_cmd.split('$',1)[1].split('$',1)[0]
             dest_path=your_cmd.split('$',1)[1].split('$',1)[1]
-            if len(src_path.strip())==0:
+            if src_path.strip().__len__==0:
                 print("malformed, please retype: up$src_path$dest_path")
                 continue
-            if len(dest_path.strip())==0:
+            if dest_path.strip().__len__==0:
                 print("malformed, please retype: up$src_path$dest_path")
                 continue
 
@@ -1035,9 +1035,13 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             # 执行一开始预设的bat脚本，将命令结果逐行设置到服务描述中
             wrap_hSchRpcRegisterTask(tschctl, command=command, schtasks_name=schtasks_name, action=tsch.TASK_UPDATE)
             tsch.hSchRpcRun(tschctl, '\\%s' % schtasks_name)
-
+            county____asdasd=0
             while True:
                 time.sleep(1)
+                county____asdasd=county____asdasd+1
+                if county____asdasd==10:
+                    print("time out, please retry or check if target file is occupied")
+                    break
                 motherfucker = retrive_service_description(svcctl, hService, service_desc_marker, my_codec=my_codec)
                 if motherfucker == '':
                     continue
