@@ -891,8 +891,8 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             if your_cmd.split('$').__len__()!=3:
                 print("malformed, please retype: up$src_path$dest_path")
                 continue
-            src_path=your_cmd.split('$',1)[1].split('$',1)[0]
-            dest_path=your_cmd.split('$',1)[1].split('$',1)[1]
+            src_path=your_cmd.split('$',1)[1].split('$',1)[0].strip()
+            dest_path=your_cmd.split('$',1)[1].split('$',1)[1].strip()
             if src_path.strip().__len__==0:
                 print("malformed, please retype: up$src_path$dest_path")
                 continue
@@ -1060,8 +1060,8 @@ echo ^<Description^>>description_header&&echo ^</Description^>^</RegistrationInf
             if your_cmd.split('$').__len__()!=3:
                 print("malformed, please retype: up$src_path$dest_path")
                 continue
-            src_path = your_cmd.split('$', 1)[1].split('$', 1)[0]
-            dest_path = your_cmd.split('$', 1)[1].split('$', 1)[1]
+            src_path = your_cmd.split('$', 1)[1].split('$', 1)[0].strip()
+            dest_path = your_cmd.split('$', 1)[1].split('$', 1)[1].strip()
             if len(src_path.strip()) == 0:
                 print("malformed, please retype: up$src_path$dest_path")
                 continue
