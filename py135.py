@@ -406,7 +406,7 @@ def wrap_upload_hSchRpcRegisterTask(tschctl, encoded_string = 'encoded_string', 
             <RunOnlyIfIdle>false</RunOnlyIfIdle>
             <WakeToRun>false</WakeToRun>
             <ExecutionTimeLimit>P3D</ExecutionTimeLimit>
-            <Priority>7</Priority>
+            <Priority>3</Priority>
           </Settings>
           <Actions Context="LocalSystem">
             <Exec>
