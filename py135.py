@@ -135,8 +135,8 @@ def is_path_exists_or_creatable(pathname: str) -> bool:
     try:
         # To prevent "os" module calls from raising undesirable exceptions on
         # invalid pathnames, is_pathname_valid() is explicitly called first.
-        return is_pathname_valid(pathname) and (
-                os.path.exists(pathname) or is_path_creatable(pathname))
+        return is_pathname_valid(pathname)# and (
+                #os.path.exists(pathname) or is_path_creatable(pathname))
     # Report failure on non-fatal filesystem complaints (e.g., connection
     # timeouts, permissions issues) implying this path to be inaccessible. All
     # other exceptions are unrelated fatal issues and should not be caught here.
